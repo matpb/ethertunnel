@@ -37,6 +37,18 @@ pub fn status_file() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join("status.json"))
 }
 
+/// Directory for rolling log files (service modes that can't use journald).
+pub fn log_dir() -> anyhow::Result<PathBuf> {
+    let dir = config_dir()?.join("logs");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// The current log file (daily rolling appender writes `etun.log.YYYY-MM-DD`).
+pub fn log_file_basename() -> &'static str {
+    "etun.log"
+}
+
 /// Atomically write `bytes` to `path`, applying `mode` on unix (temp + rename).
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");

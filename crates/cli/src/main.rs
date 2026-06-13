@@ -79,14 +79,56 @@ enum Command {
     /// Remove a tunnel from the config.
     Remove { name: String },
     /// Run the client daemon in the foreground.
-    Up,
+    Up {
+        /// Log for an init system (journald/rolling file) instead of a TTY.
+        #[arg(long)]
+        service_mode: bool,
+    },
     /// Show the running daemon's last published status.
     Status {
         #[arg(long)]
         json: bool,
     },
+    /// Install/manage the daemon as a background service.
+    Service {
+        #[command(subcommand)]
+        cmd: ServiceCmd,
+    },
+    /// Show the daemon's logs.
+    Logs {
+        /// Follow new output (like `tail -f`).
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Diagnose this client's ability to reach and use its relay.
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install and start the service.
+    Install {
+        /// Install a system-wide service (needs root) instead of per-user.
+        #[arg(long)]
+        system: bool,
+    },
+    /// Stop and remove the service.
+    Uninstall {
+        #[arg(long)]
+        system: bool,
+    },
+    Start {
+        #[arg(long)]
+        system: bool,
+    },
+    Stop {
+        #[arg(long)]
+        system: bool,
+    },
+    Status {
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,13 +217,12 @@ enum PortCmd {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    // Route logs by mode: a service uses journald (Linux) or a rolling file
+    // (macOS/Windows); everything else logs to the TTY.
+    let service_mode = matches!(cli.command, Command::Up { service_mode: true });
+    init_logging(service_mode);
+
     match cli.command {
         Command::Serve { config, check } => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -207,17 +248,75 @@ fn main() -> anyhow::Result<()> {
         } => ethertunnel_client::commands::add(name, port, hostname, tcp, local_host),
         Command::List { json } => ethertunnel_client::commands::list(json),
         Command::Remove { name } => ethertunnel_client::commands::remove(name),
-        Command::Up => {
+        Command::Up { .. } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ethertunnel_client::commands::up())
         }
         Command::Status { json } => ethertunnel_client::commands::status(json),
+        Command::Service { cmd } => {
+            use ethertunnel_client::service;
+            match cmd {
+                ServiceCmd::Install { system } => service::install(system),
+                ServiceCmd::Uninstall { system } => service::uninstall(system),
+                ServiceCmd::Start { system } => service::start(system),
+                ServiceCmd::Stop { system } => service::stop(system),
+                ServiceCmd::Status { system } => service::status(system),
+            }
+        }
+        Command::Logs { follow } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::logs(follow))
+        }
         Command::Doctor => {
             let rt = tokio::runtime::Runtime::new()?;
             if !rt.block_on(ethertunnel_client::doctor::run()) {
                 std::process::exit(1);
             }
             Ok(())
+        }
+    }
+}
+
+/// Initialise tracing for the chosen run mode.
+fn init_logging(service_mode: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+
+    if !service_mode {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return;
+    }
+
+    // Service mode. On Linux, systemd captures stderr into journald, so emit
+    // plain lines with no ANSI or redundant timestamps. On macOS/Windows there
+    // is no journal, so roll daily log files (keep 7).
+    #[cfg(target_os = "linux")]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .without_time()
+            .init();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match ethertunnel_client::paths::log_dir() {
+            Ok(dir) => {
+                let appender = tracing_appender::rolling::Builder::new()
+                    .rotation(tracing_appender::rolling::Rotation::DAILY)
+                    .filename_prefix(ethertunnel_client::paths::log_file_basename())
+                    .max_log_files(7)
+                    .build(&dir)
+                    .expect("building rolling log appender");
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_ansi(false)
+                    .with_writer(appender)
+                    .init();
+            }
+            Err(_) => {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
         }
     }
 }

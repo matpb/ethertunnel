@@ -152,6 +152,62 @@ pub fn status(json: bool) -> anyhow::Result<()> {
     }
 }
 
+/// `etun logs` — show the daemon's logs from wherever this platform routes them.
+pub async fn logs(follow: bool) -> anyhow::Result<()> {
+    let dir = crate::paths::log_dir()?;
+    // The daily appender writes `etun.log.YYYY-MM-DD`; pick the newest.
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with(crate::paths::log_file_basename()))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    let Some(latest) = files.last().cloned() else {
+        println!(
+            "no log files in {}.\n\
+             If you installed a systemd service, logs go to journald:\n  \
+             journalctl --user -u etun -f",
+            dir.display()
+        );
+        return Ok(());
+    };
+
+    // Print existing contents, then optionally follow appended bytes.
+    let mut pos = 0u64;
+    pos += print_from(&latest, pos)?;
+    if !follow {
+        return Ok(());
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        pos += print_from(&latest, pos)?;
+    }
+}
+
+/// Print bytes of `path` from byte offset `from`; return how many were printed.
+fn print_from(path: &std::path::Path, from: u64) -> anyhow::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len <= from {
+        return Ok(0);
+    }
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    std::io::stdout().write_all(&buf)?;
+    std::io::stdout().flush()?;
+    Ok(buf.len() as u64)
+}
+
 /// `etun up` — run the daemon in the foreground until interrupted.
 pub async fn up() -> anyhow::Result<()> {
     let cfg = FileConfig::load()?;

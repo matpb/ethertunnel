@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod login;
 pub mod paths;
 pub mod proxy;
+pub mod service;
 pub mod status;
 pub mod supervisor;
 pub mod tls;
