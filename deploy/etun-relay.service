@@ -1,0 +1,36 @@
+[Unit]
+Description=EtherTunnel relay
+Documentation=https://github.com/matpb/ethertunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated, unprivileged service account (create with: useradd --system --no-create-home --shell /usr/sbin/nologin etun)
+User=etun
+Group=etun
+ExecStart=/usr/local/bin/etun serve --config /etc/ethertunnel/relay.toml
+Restart=always
+RestartSec=5
+
+# Bind :443 as a non-root user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# State the relay may write to (registry DB + issued certs).
+StateDirectory=ethertunnel
+ReadWritePaths=/var/lib/ethertunnel
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

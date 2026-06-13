@@ -45,7 +45,10 @@ pub async fn run(config: &Config) -> bool {
     let mut checks: Vec<Check> = Vec::new();
 
     // --- config + registry ---
-    checks.push(Check::pass("config", format!("domain = {}", config.server.domain)));
+    checks.push(Check::pass(
+        "config",
+        format!("domain = {}", config.server.domain),
+    ));
 
     match Registry::open(&config.registry.db_path, &config.server.domain) {
         Ok(reg) => match reg.integrity_check() {
@@ -53,7 +56,10 @@ pub async fn run(config: &Config) -> bool {
                 "registry",
                 format!("{} integrity ok", config.registry.db_path.display()),
             )),
-            Err(e) => checks.push(Check::fail("registry", format!("integrity check failed: {e}"))),
+            Err(e) => checks.push(Check::fail(
+                "registry",
+                format!("integrity check failed: {e}"),
+            )),
         },
         Err(e) => checks.push(Check::fail(
             "registry",
@@ -74,7 +80,10 @@ pub async fn run(config: &Config) -> bool {
     // --- ACME credentials (only meaningful in acme mode) ---
     if config.tls.mode == TlsMode::Acme {
         match &config.tls.acme {
-            None => checks.push(Check::fail("acme config", "tls.mode=acme but [tls.acme] missing")),
+            None => checks.push(Check::fail(
+                "acme config",
+                "tls.mode=acme but [tls.acme] missing",
+            )),
             Some(acme) => match acme.cloudflare.token() {
                 Err(e) => checks.push(Check::fail("acme token", e.to_string())),
                 Ok(token) => {
@@ -84,8 +93,10 @@ pub async fn run(config: &Config) -> bool {
                     ));
                     let cf = Cloudflare::new(acme.cloudflare.zone_id.clone(), token);
                     match cf.verify_dns_edit(&apex).await {
-                        Ok(()) => checks
-                            .push(Check::pass("cloudflare", "Zone:DNS:Edit confirmed (probe TXT)")),
+                        Ok(()) => checks.push(Check::pass(
+                            "cloudflare",
+                            "Zone:DNS:Edit confirmed (probe TXT)",
+                        )),
                         Err(e) => checks.push(Check::fail("cloudflare", e.to_string())),
                     }
                 }

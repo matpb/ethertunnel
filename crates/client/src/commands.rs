@@ -211,8 +211,8 @@ fn print_from(path: &std::path::Path, from: u64) -> anyhow::Result<u64> {
 /// `etun up` — run the daemon in the foreground until interrupted.
 pub async fn up() -> anyhow::Result<()> {
     let cfg = FileConfig::load()?;
-    let token = creds::resolve(&cfg.relay)?
-        .context("no token for this relay; run `etun login` first")?;
+    let token =
+        creds::resolve(&cfg.relay)?.context("no token for this relay; run `etun login` first")?;
     let trust = cfg.trust_mode()?;
     let client_cfg = cfg.to_client_config(token, trust)?;
 

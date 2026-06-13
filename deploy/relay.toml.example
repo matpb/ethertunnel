@@ -4,7 +4,8 @@
 [server]
 # Base domain. Tunnels live at <label>.<domain>; daemons connect to
 # connect.<domain>. The wildcard *.<domain> and connect.<domain> must resolve
-# to this server's public IP.
+# to this server's public IP (DNS-only / grey-cloud; traffic does not transit
+# Cloudflare).
 domain = "ethertunnel.com"
 # Public listen address. One socket serves visitors and daemon control.
 listen = "0.0.0.0:443"
@@ -12,8 +13,33 @@ listen = "0.0.0.0:443"
 apex_response = "EtherTunnel relay"
 
 [tls]
-# "self_signed" (dev), "acme" (production wildcard via DNS-01, M6), "manual".
-mode = "self_signed"
+# "acme" (production wildcard via Let's Encrypt DNS-01), "self_signed" (dev),
+# or "manual" (operator-provided files).
+mode = "acme"
+# Where issued certs and the ACME account are cached.
+state_dir = "/var/lib/ethertunnel/tls"
+
+[tls.acme]
+# Contact email for the ACME account / expiry notices.
+email = "you@example.com"
+# Always issue against staging first on a fresh deployment, then flip to false.
+staging = true
+
+[tls.acme.cloudflare]
+# Zone id for the base domain.
+zone_id = "your-cloudflare-zone-id"
+# File holding a Cloudflare API token with Zone:DNS:Edit on the zone.
+# Keep it 0600 and owned by the relay user; never inline the token here.
+api_token_file = "/etc/ethertunnel/cloudflare.token"
+
+# Operator-provided certificate (only when mode = "manual").
+# [tls.manual]
+# cert_file = "/etc/ethertunnel/fullchain.pem"
+# key_file = "/etc/ethertunnel/key.pem"
 
 [registry]
 db_path = "/var/lib/ethertunnel/registry.db"
+
+[tcp]
+# Inclusive public-port range daemons may reserve for raw-TCP tunnels.
+port_range = [20000, 20999]

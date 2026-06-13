@@ -86,14 +86,12 @@ pub async fn serve_with(
                 Some(der)
             }
             crate::config::TlsMode::Manual => {
-                let manual = config
-                    .tls
-                    .manual
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("tls.mode = manual requires [tls.manual]"))?;
-                let cert = std::fs::read(&manual.cert_file).map_err(|e| {
-                    anyhow::anyhow!("reading {}: {e}", manual.cert_file.display())
-                })?;
+                let manual =
+                    config.tls.manual.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("tls.mode = manual requires [tls.manual]")
+                    })?;
+                let cert = std::fs::read(&manual.cert_file)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", manual.cert_file.display()))?;
                 let key = std::fs::read(&manual.key_file)
                     .map_err(|e| anyhow::anyhow!("reading {}: {e}", manual.key_file.display()))?;
                 let ck = tls::certified_key_from_pem(&cert, &key)?;

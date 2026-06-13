@@ -170,7 +170,10 @@ impl AcmeManager {
                     // Already installed at boot; just compute the next wake-up.
                     return Ok(remaining - RENEW_BEFORE);
                 }
-                tracing::info!(?remaining, "acme: certificate within renewal window; renewing");
+                tracing::info!(
+                    ?remaining,
+                    "acme: certificate within renewal window; renewing"
+                );
             }
         }
 
@@ -183,7 +186,9 @@ impl AcmeManager {
         let remaining = not_after
             .duration_since(SystemTime::now())
             .unwrap_or(Duration::ZERO);
-        Ok(remaining.saturating_sub(RENEW_BEFORE).max(Duration::from_secs(3600)))
+        Ok(remaining
+            .saturating_sub(RENEW_BEFORE)
+            .max(Duration::from_secs(3600)))
     }
 
     /// Load a cached ACME account or register a new one, caching its credentials.
@@ -251,7 +256,9 @@ impl AcmeManager {
 
         // Provision every TXT, then wait for all of them to be visible.
         let mut created: Vec<TxtRecord> = Vec::new();
-        let issue_result = self.provision_and_finalize(&cf, &mut order, &wanted, &mut created).await;
+        let issue_result = self
+            .provision_and_finalize(&cf, &mut order, &wanted, &mut created)
+            .await;
 
         // Always clean up the challenge records, success or failure.
         for rec in &created {

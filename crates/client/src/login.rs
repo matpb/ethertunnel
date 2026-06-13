@@ -14,8 +14,8 @@ use ethertunnel_proto::transport::{mux_connection, mux_io_client};
 use futures::future::poll_fn;
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_rustls::TlsConnector;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::tls::{client_config, TrustMode};
 

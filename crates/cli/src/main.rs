@@ -279,8 +279,8 @@ fn main() -> anyhow::Result<()> {
 
 /// Initialise tracing for the chosen run mode.
 fn init_logging(service_mode: bool) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
 
     if !service_mode {
         tracing_subscriber::fmt().with_env_filter(filter).init();

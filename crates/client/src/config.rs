@@ -117,7 +117,11 @@ impl FileConfig {
     }
 
     /// Build the runtime [`ClientConfig`] the supervisor consumes.
-    pub fn to_client_config(&self, token: String, trust: TrustMode) -> anyhow::Result<ClientConfig> {
+    pub fn to_client_config(
+        &self,
+        token: String,
+        trust: TrustMode,
+    ) -> anyhow::Result<ClientConfig> {
         if self.relay.is_empty() {
             bail!("no relay configured; run `etun login` first");
         }
@@ -196,6 +200,8 @@ mod tests {
                 public_port: None,
             }],
         };
-        assert!(cfg.to_client_config("etun_x".into(), TrustMode::System).is_err());
+        assert!(cfg
+            .to_client_config("etun_x".into(), TrustMode::System)
+            .is_err());
     }
 }

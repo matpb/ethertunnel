@@ -143,9 +143,8 @@ pub struct CloudflareConfig {
 impl CloudflareConfig {
     /// Read and trim the API token from `api_token_file`.
     pub fn token(&self) -> anyhow::Result<String> {
-        let raw = std::fs::read_to_string(&self.api_token_file).map_err(|e| {
-            anyhow::anyhow!("reading {}: {e}", self.api_token_file.display())
-        })?;
+        let raw = std::fs::read_to_string(&self.api_token_file)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.api_token_file.display()))?;
         Ok(raw.trim().to_owned())
     }
 }

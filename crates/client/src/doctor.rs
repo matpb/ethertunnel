@@ -51,10 +51,7 @@ pub async fn run() -> bool {
         return false;
     }
     checks.push(pass("config", format!("relay = {}", cfg.relay)));
-    checks.push(pass(
-        "tunnels",
-        format!("{} configured", cfg.tunnels.len()),
-    ));
+    checks.push(pass("tunnels", format!("{} configured", cfg.tunnels.len())));
 
     let token = creds::resolve(&cfg.relay).ok().flatten();
     match &token {
@@ -75,9 +72,7 @@ pub async fn run() -> bool {
 
     // TLS handshake + certificate expiry against the live relay.
     match login::tls_probe(&cfg.relay, &trust).await {
-        Ok(info) if info.expired => {
-            checks.push(fail("relay tls", "certificate has expired"))
-        }
+        Ok(info) if info.expired => checks.push(fail("relay tls", "certificate has expired")),
         Ok(info) => checks.push(pass(
             "relay tls",
             format!("valid, ~{} days remaining", info.days_remaining),

@@ -88,7 +88,11 @@ mod imp {
              \n\
              [Install]\n\
              WantedBy={target}\n",
-            target = if system { "multi-user.target" } else { "default.target" },
+            target = if system {
+                "multi-user.target"
+            } else {
+                "default.target"
+            },
         ))
     }
 
@@ -113,7 +117,9 @@ mod imp {
         // enable-linger lets a user service keep running after logout.
         if !system {
             if let Ok(user) = std::env::var("USER") {
-                let _ = Command::new("loginctl").args(["enable-linger", &user]).status();
+                let _ = Command::new("loginctl")
+                    .args(["enable-linger", &user])
+                    .status();
             }
         }
         systemctl(system, &["enable", "--now", "etun.service"])?;
@@ -196,13 +202,19 @@ mod imp {
         std::fs::write(&path, plist_text()?)
             .with_context(|| format!("writing {}", path.display()))?;
         println!("wrote {}", path.display());
-        let _ = Command::new("launchctl").args(["load", "-w"]).arg(&path).status();
+        let _ = Command::new("launchctl")
+            .args(["load", "-w"])
+            .arg(&path)
+            .status();
         println!("etun launchd agent installed");
         Ok(())
     }
     pub fn uninstall(system: bool) -> anyhow::Result<()> {
         let path = plist_path(system)?;
-        let _ = Command::new("launchctl").args(["unload", "-w"]).arg(&path).status();
+        let _ = Command::new("launchctl")
+            .args(["unload", "-w"])
+            .arg(&path)
+            .status();
         if path.exists() {
             std::fs::remove_file(&path)?;
             println!("removed {}", path.display());
