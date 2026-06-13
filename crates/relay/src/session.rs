@@ -71,13 +71,18 @@ fn negotiate(peer_min: u16, peer_max: u16) -> Option<u16> {
 }
 
 /// Drive one daemon connection until it closes. Assigns the session id, waits
-/// for the control stream, and cleans up the routing table on exit.
-pub async fn run_session<T>(mut conn: yamux::Connection<MuxIo<T>>, ctx: Arc<SessionCtx>)
-where
+/// for the control stream, and cleans up the routing table on exit. `shutdown`
+/// is the relay-wide token: when it fires (graceful shutdown / restart) the
+/// session tears down, which the daemon sees as a disconnect and reconnects.
+pub async fn run_session<T>(
+    mut conn: yamux::Connection<MuxIo<T>>,
+    ctx: Arc<SessionCtx>,
+    shutdown: CancellationToken,
+) where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let session_id = ctx.next_id();
-    let cancel = CancellationToken::new();
+    let cancel = shutdown.child_token();
     let mut control_started = false;
 
     tracing::debug!(session_id, "session started");
@@ -359,7 +364,7 @@ mod tests {
         // Relay side.
         let relay_io = mux_io(b, Role::Server).await;
         let relay_conn = mux_connection(relay_io, yamux::Mode::Server);
-        tokio::spawn(run_session(relay_conn, ctx));
+        tokio::spawn(run_session(relay_conn, ctx, CancellationToken::new()));
 
         // Daemon side: open the control stream, then drive the connection.
         let daemon_io = mux_io(a, Role::Client).await;

@@ -3,5 +3,13 @@
 //! Opens a single outbound WebSocket to the relay (no inbound ports, no
 //! firewall changes) and exposes local services as public HTTPS endpoints.
 //!
-//! Built incrementally — see the milestone plan. M0 establishes the workspace
-//! and the proto transport seam; client internals land in M2+.
+//! Built incrementally — see the milestone plan. M2 adds the TLS client config
+//! and the connection supervisor (connect, authenticate, claim, heartbeat,
+//! reconnect). Local proxying lands in M3; config/credentials files, IPC, and
+//! service install follow in M5/M7.
+
+pub mod supervisor;
+pub mod tls;
+
+pub use supervisor::{ClientConfig, ConnState, DaemonStatus};
+pub use tls::TrustMode;

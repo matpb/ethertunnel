@@ -160,6 +160,25 @@ where
     WsByteStream::new(ws)
 }
 
+/// Perform a WebSocket *client* handshake over an already-established
+/// (typically TLS) byte stream, then expose it as a yamux-ready byte stream.
+///
+/// The relay side uses [`mux_io`] with [`Role::Server`] after hyper completes
+/// the HTTP 101 upgrade; the client side uses this, which sends the upgrade
+/// request itself. `url` supplies the `Host` and path of the handshake (e.g.
+/// `wss://connect.example.com/connect`) — no TLS is performed here, `io` must
+/// already be encrypted if required.
+pub async fn mux_io_client<T>(
+    io: T,
+    url: &str,
+) -> Result<MuxIo<T>, async_tungstenite::tungstenite::Error>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (ws, _resp) = async_tungstenite::client_async(url, io.compat()).await?;
+    Ok(WsByteStream::new(ws))
+}
+
 /// Build a yamux connection with EtherTunnel's bounded receive windows.
 ///
 /// The connection-level window caps total buffering for one daemon session;
