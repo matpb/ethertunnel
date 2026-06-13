@@ -88,10 +88,73 @@ pub struct ServerConfig {
     pub apex_response: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TlsConfig {
     #[serde(default)]
     pub mode: TlsMode,
+    /// Where issued certs and the ACME account are cached.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: PathBuf,
+    /// ACME settings (required when `mode = "acme"`).
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+    /// Operator-provided cert/key (required when `mode = "manual"`).
+    #[serde(default)]
+    pub manual: Option<ManualConfig>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: TlsMode::default(),
+            state_dir: default_state_dir(),
+            acme: None,
+            manual: None,
+        }
+    }
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/ethertunnel/tls")
+}
+
+/// ACME issuance via Let's Encrypt DNS-01 (Cloudflare-hosted zone).
+#[derive(Clone, Debug, Deserialize)]
+pub struct AcmeConfig {
+    /// Contact email registered with the ACME account.
+    pub email: String,
+    /// Use the Let's Encrypt staging environment (untrusted certs, high rate
+    /// limits) — always issue against staging first on a fresh deployment.
+    #[serde(default)]
+    pub staging: bool,
+    pub cloudflare: CloudflareConfig,
+}
+
+/// Cloudflare credentials for the DNS-01 challenge.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CloudflareConfig {
+    /// The zone id for the relay's base domain.
+    pub zone_id: String,
+    /// File containing a Cloudflare API token with Zone:DNS:Edit on the zone.
+    /// Kept out of the config so the token never lands in a world-readable file.
+    pub api_token_file: PathBuf,
+}
+
+impl CloudflareConfig {
+    /// Read and trim the API token from `api_token_file`.
+    pub fn token(&self) -> anyhow::Result<String> {
+        let raw = std::fs::read_to_string(&self.api_token_file).map_err(|e| {
+            anyhow::anyhow!("reading {}: {e}", self.api_token_file.display())
+        })?;
+        Ok(raw.trim().to_owned())
+    }
+}
+
+/// Operator-provided certificate files.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ManualConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
 }
 
 /// How the relay obtains its TLS certificate.

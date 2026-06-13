@@ -68,6 +68,8 @@ enum AdminAction {
         #[command(subcommand)]
         cmd: PortCmd,
     },
+    /// Pre-flight diagnostics: DNS, registry, TLS material, ACME credentials.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -188,6 +190,20 @@ fn run_admin(
     domain: Option<String>,
     action: AdminAction,
 ) -> anyhow::Result<()> {
+    // Doctor needs the whole config (TLS/ACME sections), not just db + domain.
+    if matches!(&action, AdminAction::Doctor) {
+        let cfg = config
+            .as_ref()
+            .context("doctor needs --config <relay.toml>")?;
+        let cfg = Config::load(cfg)?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let ok = rt.block_on(ethertunnel_relay::doctor::run(&cfg));
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Resolve db path + domain from explicit flags or the config file.
     let (db_path, domain) = match (db, domain) {
         (Some(db), Some(domain)) => (db, domain),
@@ -282,6 +298,8 @@ fn run_admin(
                 }
             }
         },
+        // Handled before the registry is opened (needs the full config).
+        AdminAction::Doctor => unreachable!("doctor is dispatched earlier"),
     }
     Ok(())
 }

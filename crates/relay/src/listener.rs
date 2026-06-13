@@ -69,6 +69,10 @@ pub async fn serve_with(
 ) -> anyhow::Result<RelayHandle> {
     tls::ensure_crypto_provider();
 
+    // The relay-wide shutdown token, created up front so the ACME renewal task
+    // can be tied to it (and stop when the relay does).
+    let cancel = CancellationToken::new();
+
     let resolver = Arc::new(SniResolver::new(&config.server.domain));
     let cert_der = match injected {
         Some((ck, der)) => {
@@ -81,14 +85,46 @@ pub async fn serve_with(
                 resolver.install(ck);
                 Some(der)
             }
-            other => anyhow::bail!("TLS mode {other:?} is not implemented until M6"),
+            crate::config::TlsMode::Manual => {
+                let manual = config
+                    .tls
+                    .manual
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tls.mode = manual requires [tls.manual]"))?;
+                let cert = std::fs::read(&manual.cert_file).map_err(|e| {
+                    anyhow::anyhow!("reading {}: {e}", manual.cert_file.display())
+                })?;
+                let key = std::fs::read(&manual.key_file)
+                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", manual.key_file.display()))?;
+                let ck = tls::certified_key_from_pem(&cert, &key)?;
+                resolver.install(ck);
+                tls::first_cert_der(&cert).ok()
+            }
+            crate::config::TlsMode::Acme => {
+                let acme = config
+                    .tls
+                    .acme
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tls.mode = acme requires [tls.acme]"))?;
+                let token = acme.cloudflare.token()?;
+                let manager = crate::acme::AcmeManager::new(
+                    config.server.domain.clone(),
+                    config.tls.state_dir.clone(),
+                    acme.email.clone(),
+                    acme.staging,
+                    acme.cloudflare.zone_id.clone(),
+                    token,
+                );
+                // Installs cached-or-self-signed immediately and issues/renews in
+                // the background, so the listener never blocks on ACME.
+                manager.boot(resolver.clone(), cancel.clone())?
+            }
         },
     };
 
     let acceptor = TlsAcceptor::from(tls::server_config(resolver));
     let listener = TcpListener::bind(config.server.listen).await?;
     let local_addr = listener.local_addr()?;
-    let cancel = CancellationToken::new();
     let domain = config.server.domain.clone();
 
     // Per-IP accept limiter (pre-TLS) and the raw-TCP tunnel port manager.

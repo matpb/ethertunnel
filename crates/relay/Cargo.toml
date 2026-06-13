@@ -33,6 +33,11 @@ toml = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
+x509-parser = "0.18.1"
+serde_json.workspace = true
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["ring", "webpki-tokio", "http1", "http2", "tls12"] }
+rustls-pemfile = "2.2.0"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

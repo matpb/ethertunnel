@@ -57,6 +57,7 @@ async fn start_relay(ctx: Arc<SessionCtx>, pub_port: u16) -> RelayHandle {
         },
         tls: TlsConfig {
             mode: TlsMode::SelfSigned,
+            ..Default::default()
         },
         registry: Default::default(),
         // Restrict the range to exactly the test's public port.

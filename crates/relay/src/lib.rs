@@ -8,8 +8,11 @@
 //! protocol; M2 adds the `:443` TLS listener and the WebSocket-upgrade path
 //! that turns an inbound connection into a session. The HTTP proxy lands in M3.
 
+pub mod acme;
 pub mod auth;
 pub mod config;
+pub mod dns_cloudflare;
+pub mod doctor;
 pub mod listener;
 pub mod proxy;
 pub mod ratelimit;

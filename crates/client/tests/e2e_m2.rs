@@ -29,6 +29,7 @@ fn relay_config(listen: SocketAddr) -> Arc<Config> {
         },
         tls: TlsConfig {
             mode: TlsMode::SelfSigned,
+            ..Default::default()
         },
         registry: Default::default(),
         tcp: Default::default(),
