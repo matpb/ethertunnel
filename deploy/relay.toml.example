@@ -1,0 +1,19 @@
+# EtherTunnel relay configuration (example).
+# Copy to /etc/ethertunnel/relay.toml and edit.
+
+[server]
+# Base domain. Tunnels live at <label>.<domain>; daemons connect to
+# connect.<domain>. The wildcard *.<domain> and connect.<domain> must resolve
+# to this server's public IP.
+domain = "ethertunnel.com"
+# Public listen address. One socket serves visitors and daemon control.
+listen = "0.0.0.0:443"
+# Body returned for a plain GET on the apex.
+apex_response = "EtherTunnel relay"
+
+[tls]
+# "self_signed" (dev), "acme" (production wildcard via DNS-01, M6), "manual".
+mode = "self_signed"
+
+[registry]
+db_path = "/var/lib/ethertunnel/registry.db"

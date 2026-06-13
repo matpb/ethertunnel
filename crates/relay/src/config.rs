@@ -5,6 +5,7 @@
 //! configs keep loading.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -14,6 +15,35 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub registry: RegistryConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RegistryConfig {
+    #[serde(default = "default_db_path")]
+    pub db_path: PathBuf,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_db_path(),
+        }
+    }
+}
+
+fn default_db_path() -> PathBuf {
+    PathBuf::from("/var/lib/ethertunnel/registry.db")
+}
+
+impl Config {
+    /// Load and parse a relay config from a TOML file.
+    pub fn load(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.as_ref().display()))?;
+        toml::from_str(&text).map_err(|e| anyhow::anyhow!("parsing config: {e}"))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

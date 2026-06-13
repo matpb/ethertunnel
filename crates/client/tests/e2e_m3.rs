@@ -42,6 +42,7 @@ async fn start_relay(ctx: Arc<SessionCtx>) -> RelayHandle {
         tls: TlsConfig {
             mode: TlsMode::SelfSigned,
         },
+        registry: Default::default(),
     });
     serve(config, ctx).await.expect("relay starts")
 }
