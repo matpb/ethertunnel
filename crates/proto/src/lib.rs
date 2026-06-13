@@ -7,6 +7,8 @@
 //! to test over an in-memory duplex (see `transport` tests) and easy to reason
 //! about when the wire format must stay stable across versions.
 
+pub mod codec;
+pub mod frames;
 pub mod limits;
 pub mod transport;
 
