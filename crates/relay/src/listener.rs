@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::proxy;
+use crate::ratelimit::RateLimiter;
 use crate::session::{run_session, SessionCtx};
+use crate::tcp::TcpPortManager;
 use crate::tls::{self, SniResolver};
 
 /// A running relay. Dropping it (or calling [`RelayHandle::shutdown`]) stops the
@@ -89,7 +91,19 @@ pub async fn serve_with(
     let cancel = CancellationToken::new();
     let domain = config.server.domain.clone();
 
+    // Per-IP accept limiter (pre-TLS) and the raw-TCP tunnel port manager.
+    let rate = Arc::new(RateLimiter::new(20, 40));
+    let tcp_manager = TcpPortManager::new(
+        local_addr.ip(),
+        config.tcp.port_range,
+        ctx.router.clone(),
+        rate.clone(),
+        cancel.clone(),
+    );
+    ctx.set_tcp(tcp_manager);
+
     let accept_cancel = cancel.clone();
+    let accept_rate = rate.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -97,6 +111,10 @@ pub async fn serve_with(
                 _ = accept_cancel.cancelled() => break,
                 accepted = listener.accept() => {
                     match accepted {
+                        Ok((stream, peer)) if !accept_rate.check(peer.ip()) => {
+                            tracing::debug!(%peer, "rate limited; dropping connection");
+                            drop(stream);
+                        }
                         Ok((stream, peer)) => {
                             let acceptor = acceptor.clone();
                             let ctx = ctx.clone();

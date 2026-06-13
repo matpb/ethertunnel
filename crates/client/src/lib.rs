@@ -12,5 +12,5 @@ pub mod proxy;
 pub mod supervisor;
 pub mod tls;
 
-pub use supervisor::{ClientConfig, ConnState, DaemonStatus, HttpTunnel};
+pub use supervisor::{ClientConfig, ConnState, DaemonStatus, HttpTunnel, TcpTunnel};
 pub use tls::TrustMode;

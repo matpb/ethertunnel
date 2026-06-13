@@ -18,15 +18,23 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
-/// Where a tunnel hostname forwards to locally.
+/// Where a tunnel forwards to locally.
 #[derive(Clone, Debug)]
 pub struct LocalTarget {
     pub host: String,
     pub port: u16,
 }
 
-/// Map of tunnel hostname → local target, shared across inbound streams.
-pub type Routes = Arc<HashMap<String, LocalTarget>>;
+/// Forwarding tables: HTTP tunnels keyed by hostname, TCP tunnels by public
+/// port. Shared (read-only) across inbound streams.
+#[derive(Default)]
+pub struct RouteTable {
+    pub http: HashMap<String, LocalTarget>,
+    pub tcp: HashMap<u16, LocalTarget>,
+}
+
+/// Shared handle to the forwarding tables.
+pub type Routes = Arc<RouteTable>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -42,17 +50,34 @@ pub async fn handle_inbound(stream: yamux::Stream, routes: Routes) {
     };
 
     match header {
-        StreamHeader::Http { host, .. } => match routes.get(&host) {
+        StreamHeader::Http { host, .. } => match routes.http.get(&host) {
             Some(target) => forward_http(io, target).await,
             None => {
                 // The relay routed a host we don't serve; shouldn't happen.
                 write_502(&mut io, &host).await;
             }
         },
-        StreamHeader::Tcp { .. } => {
-            // Raw TCP forwarding lands in M5; drop the stream for now.
-            tracing::debug!("tcp stream received before tcp support; dropping");
+        StreamHeader::Tcp { port, .. } => match routes.tcp.get(&port) {
+            Some(target) => forward_tcp(io, target).await,
+            None => tracing::debug!(port, "tcp stream for unmapped port; dropping"),
+        },
+    }
+}
+
+/// Splice a raw-TCP stream to its local target. Unlike HTTP, there's no
+/// protocol to synthesize an error into, so a failed connect just closes.
+async fn forward_tcp(mut io: Compat<yamux::Stream>, target: &LocalTarget) {
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((target.host.as_str(), target.port)),
+    )
+    .await
+    {
+        Ok(Ok(mut local)) => {
+            let _ = local.set_nodelay(true);
+            let _ = tokio::io::copy_bidirectional(&mut io, &mut local).await;
         }
+        _ => tracing::debug!(port = target.port, "tcp local connect failed"),
     }
 }
 

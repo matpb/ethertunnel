@@ -35,6 +35,15 @@ pub struct HttpTunnel {
     pub local_port: u16,
 }
 
+/// One raw-TCP tunnel: a public port forwarding to a local address.
+#[derive(Clone, Debug)]
+pub struct TcpTunnel {
+    /// Public TCP port on the relay.
+    pub public_port: u16,
+    pub local_host: String,
+    pub local_port: u16,
+}
+
 /// What the daemon should connect and claim.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -46,6 +55,8 @@ pub struct ClientConfig {
     pub token: String,
     /// HTTP tunnels to claim and serve.
     pub http_tunnels: Vec<HttpTunnel>,
+    /// Raw-TCP tunnels to claim and serve.
+    pub tcp_tunnels: Vec<TcpTunnel>,
     /// How to trust the relay's TLS certificate.
     pub trust: TrustMode,
 }
@@ -62,22 +73,33 @@ impl ClientConfig {
             .collect()
     }
 
-    /// Build the hostname → local-target routing map for inbound streams.
+    fn claim_ports(&self) -> Vec<u16> {
+        self.tcp_tunnels.iter().map(|t| t.public_port).collect()
+    }
+
+    /// Build the forwarding tables for inbound streams.
     fn routes(&self) -> crate::proxy::Routes {
-        let map = self
-            .http_tunnels
-            .iter()
-            .map(|t| {
-                (
-                    t.hostname.clone(),
-                    crate::proxy::LocalTarget {
-                        host: t.local_host.clone(),
-                        port: t.local_port,
-                    },
-                )
-            })
-            .collect();
-        std::sync::Arc::new(map)
+        use crate::proxy::{LocalTarget, RouteTable};
+        let mut table = RouteTable::default();
+        for t in &self.http_tunnels {
+            table.http.insert(
+                t.hostname.clone(),
+                LocalTarget {
+                    host: t.local_host.clone(),
+                    port: t.local_port,
+                },
+            );
+        }
+        for t in &self.tcp_tunnels {
+            table.tcp.insert(
+                t.public_port,
+                LocalTarget {
+                    host: t.local_host.clone(),
+                    port: t.local_port,
+                },
+            );
+        }
+        std::sync::Arc::new(table)
     }
 }
 
@@ -286,12 +308,13 @@ async fn connect_once(
 
     // Claim (if anything to claim).
     let claim_hostnames = cfg.claim_hostnames();
-    if !claim_hostnames.is_empty() {
+    let claim_ports = cfg.claim_ports();
+    if !claim_hostnames.is_empty() || !claim_ports.is_empty() {
         codec::write_frame(
             &mut ctrl,
             &ControlFrame::Claim {
                 hostnames: claim_hostnames,
-                tcp_ports: vec![],
+                tcp_ports: claim_ports,
             },
             MAX_CONTROL_FRAME,
         )

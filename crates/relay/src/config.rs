@@ -17,6 +17,35 @@ pub struct Config {
     pub tls: TlsConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
+    #[serde(default)]
+    pub tcp: TcpConfig,
+}
+
+/// Raw-TCP tunnel settings.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TcpConfig {
+    /// Inclusive `[low, high]` range of public ports daemons may reserve. Keeps
+    /// tunnels off privileged/service ports by construction.
+    #[serde(default = "default_port_range")]
+    pub port_range: [u16; 2],
+}
+
+impl Default for TcpConfig {
+    fn default() -> Self {
+        Self {
+            port_range: default_port_range(),
+        }
+    }
+}
+
+impl TcpConfig {
+    pub fn in_range(&self, port: u16) -> bool {
+        port >= self.port_range[0] && port <= self.port_range[1]
+    }
+}
+
+fn default_port_range() -> [u16; 2] {
+    [20000, 20999]
 }
 
 #[derive(Clone, Debug, Deserialize)]

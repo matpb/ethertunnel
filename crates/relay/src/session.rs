@@ -68,6 +68,10 @@ pub struct SessionCtx {
     pub router: Arc<Router>,
     pub auth: Arc<dyn Authenticator>,
     pub server_version: String,
+    /// Raw-TCP port manager, installed by `serve` once the relay's listener and
+    /// shutdown token exist. `None` means TCP tunnels are unavailable (tests,
+    /// or before installation), and TCP claims are denied.
+    pub tcp: arc_swap::ArcSwapOption<crate::tcp::TcpPortManager>,
     next_session_id: AtomicU64,
 }
 
@@ -81,8 +85,14 @@ impl SessionCtx {
             router,
             auth,
             server_version,
+            tcp: arc_swap::ArcSwapOption::empty(),
             next_session_id: AtomicU64::new(1),
         })
+    }
+
+    /// Install the raw-TCP port manager (called by `serve`).
+    pub fn set_tcp(&self, manager: Arc<crate::tcp::TcpPortManager>) {
+        self.tcp.store(Some(manager));
     }
 
     fn next_id(&self) -> u64 {
@@ -364,12 +374,32 @@ async fn handle_claim(
             return;
         }
     }
+    let tcp = ctx.tcp.load_full();
     for port in &tcp_ports {
-        if !ctx.auth.owns_port(user.user_id, *port) {
+        let Some(manager) = &tcp else {
+            let _ = ctrl_tx
+                .send(ControlFrame::Denied {
+                    code: DenyCode::PortNotReserved,
+                    message: "tcp tunnels are not enabled on this relay".into(),
+                })
+                .await;
+            return;
+        };
+        if !manager.in_range(*port) || !ctx.auth.owns_port(user.user_id, *port) {
             let _ = ctrl_tx
                 .send(ControlFrame::Denied {
                     code: DenyCode::PortNotReserved,
                     message: format!("port {port} not reserved"),
+                })
+                .await;
+            return;
+        }
+        // Bind-before-grant: never route a port we couldn't actually serve.
+        if let Err(e) = manager.ensure_bound(*port).await {
+            let _ = ctrl_tx
+                .send(ControlFrame::Denied {
+                    code: DenyCode::PortUnavailable,
+                    message: format!("port {port} unavailable: {e}"),
                 })
                 .await;
             return;
@@ -519,26 +549,24 @@ mod tests {
 
         let _sid = handshake(&mut ctrl, "etun_good").await;
 
+        // This duplex-based test has no TCP port manager (no listener stack), so
+        // it claims only the hostname; raw-TCP claims are covered end-to-end in
+        // the e2e suite where a real listener exists.
         send(
             &mut ctrl,
             ControlFrame::Claim {
                 hostnames: vec!["myapp.ethertunnel.com".into()],
-                tcp_ports: vec![20000],
+                tcp_ports: vec![],
             },
         )
         .await;
         match recv(&mut ctrl).await {
-            ControlFrame::Granted {
-                hostnames,
-                tcp_ports,
-            } => {
+            ControlFrame::Granted { hostnames, .. } => {
                 assert_eq!(hostnames, vec!["myapp.ethertunnel.com".to_string()]);
-                assert_eq!(tcp_ports, vec![20000]);
             }
             other => panic!("expected Granted, got {other:?}"),
         }
         assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
-        assert!(router.lookup_tcp(20000).is_some());
 
         send(&mut ctrl, ControlFrame::Ping { nonce: 99 }).await;
         match recv(&mut ctrl).await {

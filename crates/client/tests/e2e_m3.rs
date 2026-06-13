@@ -43,6 +43,7 @@ async fn start_relay(ctx: Arc<SessionCtx>) -> RelayHandle {
             mode: TlsMode::SelfSigned,
         },
         registry: Default::default(),
+        tcp: Default::default(),
     });
     serve(config, ctx).await.expect("relay starts")
 }
@@ -131,6 +132,7 @@ async fn run_daemon(
             local_host: "127.0.0.1".to_owned(),
             local_port,
         }],
+        tcp_tunnels: vec![],
         trust: TrustMode::CustomRoot(relay.cert_der.clone().unwrap()),
     };
     let (tx, mut rx) = watch::channel(DaemonStatus::default());

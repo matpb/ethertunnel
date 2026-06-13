@@ -12,9 +12,11 @@ pub mod auth;
 pub mod config;
 pub mod listener;
 pub mod proxy;
+pub mod ratelimit;
 pub mod registry;
 pub mod router;
 pub mod session;
+pub mod tcp;
 pub mod tls;
 
 pub use config::{Config, TlsMode};

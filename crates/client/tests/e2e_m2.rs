@@ -31,6 +31,7 @@ fn relay_config(listen: SocketAddr) -> Arc<Config> {
             mode: TlsMode::SelfSigned,
         },
         registry: Default::default(),
+        tcp: Default::default(),
     })
 }
 
@@ -80,6 +81,7 @@ async fn daemon_connects_authenticates_and_claims() {
         relay_host: DOMAIN.to_owned(),
         relay_addr: Some(relay.local_addr),
         token: TOKEN.to_owned(),
+        tcp_tunnels: vec![],
         http_tunnels: vec![HttpTunnel {
             hostname: HOST.to_owned(),
             local_host: "127.0.0.1".to_owned(),
@@ -117,6 +119,7 @@ async fn bad_token_reports_auth_failed() {
         relay_addr: Some(relay.local_addr),
         token: "etun_wrong".to_owned(),
         http_tunnels: vec![],
+        tcp_tunnels: vec![],
         trust: TrustMode::CustomRoot(cert),
     };
 
@@ -155,6 +158,7 @@ async fn daemon_reclaims_after_relay_restart() {
         relay_host: DOMAIN.to_owned(),
         relay_addr: Some(addr),
         token: TOKEN.to_owned(),
+        tcp_tunnels: vec![],
         http_tunnels: vec![HttpTunnel {
             hostname: HOST.to_owned(),
             local_host: "127.0.0.1".to_owned(),
