@@ -25,6 +25,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tls::{client_config, TrustMode};
 
+/// One HTTP tunnel: a public hostname forwarding to a local address.
+#[derive(Clone, Debug)]
+pub struct HttpTunnel {
+    /// Fully-qualified public hostname (e.g. `demo.ethertunnel.com`).
+    pub hostname: String,
+    /// Local address to forward to.
+    pub local_host: String,
+    pub local_port: u16,
+}
+
 /// What the daemon should connect and claim.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -34,10 +44,8 @@ pub struct ClientConfig {
     pub relay_addr: Option<SocketAddr>,
     /// Bearer token presented in `Hello`.
     pub token: String,
-    /// Fully-qualified hostnames to claim.
-    pub hostnames: Vec<String>,
-    /// Public TCP ports to claim.
-    pub tcp_ports: Vec<u16>,
+    /// HTTP tunnels to claim and serve.
+    pub http_tunnels: Vec<HttpTunnel>,
     /// How to trust the relay's TLS certificate.
     pub trust: TrustMode,
 }
@@ -45,6 +53,31 @@ pub struct ClientConfig {
 impl ClientConfig {
     fn connect_host(&self) -> String {
         format!("connect.{}", self.relay_host)
+    }
+
+    fn claim_hostnames(&self) -> Vec<String> {
+        self.http_tunnels
+            .iter()
+            .map(|t| t.hostname.clone())
+            .collect()
+    }
+
+    /// Build the hostname → local-target routing map for inbound streams.
+    fn routes(&self) -> crate::proxy::Routes {
+        let map = self
+            .http_tunnels
+            .iter()
+            .map(|t| {
+                (
+                    t.hostname.clone(),
+                    crate::proxy::LocalTarget {
+                        host: t.local_host.clone(),
+                        port: t.local_port,
+                    },
+                )
+            })
+            .collect();
+        std::sync::Arc::new(map)
     }
 }
 
@@ -192,8 +225,11 @@ async fn connect_once(
         .await
         .map_err(|e| ConnError::Setup(format!("open control stream: {e}")))?;
 
-    // Drive the connection in the background for the stream's lifetime.
+    // Drive the connection in the background for the stream's lifetime,
+    // dispatching each inbound stream (one per visitor connection) to the local
+    // forwarder.
     let driver_cancel = cancel.child_token();
+    let routes = cfg.routes();
     {
         let dc = driver_cancel.clone();
         tokio::spawn(async move {
@@ -201,8 +237,11 @@ async fn connect_once(
                 tokio::select! {
                     _ = dc.cancelled() => break,
                     next = poll_fn(|cx| conn.poll_next_inbound(cx)) => {
-                        if !matches!(next, Some(Ok(_))) {
-                            break;
+                        match next {
+                            Some(Ok(stream)) => {
+                                tokio::spawn(crate::proxy::handle_inbound(stream, routes.clone()));
+                            }
+                            _ => break,
                         }
                     }
                 }
@@ -246,12 +285,13 @@ async fn connect_once(
     }
 
     // Claim (if anything to claim).
-    if !cfg.hostnames.is_empty() || !cfg.tcp_ports.is_empty() {
+    let claim_hostnames = cfg.claim_hostnames();
+    if !claim_hostnames.is_empty() {
         codec::write_frame(
             &mut ctrl,
             &ControlFrame::Claim {
-                hostnames: cfg.hostnames.clone(),
-                tcp_ports: cfg.tcp_ports.clone(),
+                hostnames: claim_hostnames,
+                tcp_ports: vec![],
             },
             MAX_CONTROL_FRAME,
         )

@@ -8,8 +8,9 @@
 //! reconnect). Local proxying lands in M3; config/credentials files, IPC, and
 //! service install follow in M5/M7.
 
+pub mod proxy;
 pub mod supervisor;
 pub mod tls;
 
-pub use supervisor::{ClientConfig, ConnState, DaemonStatus};
+pub use supervisor::{ClientConfig, ConnState, DaemonStatus, HttpTunnel};
 pub use tls::TrustMode;

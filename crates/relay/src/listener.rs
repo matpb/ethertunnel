@@ -11,18 +11,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_tungstenite::tungstenite::handshake::derive_accept_key;
-use bytes::Bytes;
 use ethertunnel_proto::transport::{mux_connection, mux_io, Role};
-use http_body_util::Full;
-use hyper::header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
+use hyper::header::{HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::proxy;
 use crate::session::{run_session, SessionCtx};
 use crate::tls::{self, SniResolver};
 
@@ -152,7 +151,7 @@ async fn handle_conn(
             let ctx = ctx.clone();
             let config = config.clone();
             let cancel = cancel.clone();
-            async move { route(req, ctx, config, cancel).await }
+            async move { route(req, ctx, config, peer, cancel).await }
         })
     };
 
@@ -172,30 +171,39 @@ async fn handle_conn(
     }
 }
 
-/// Route one HTTP request. In M2 the only live route is the daemon control
-/// upgrade; visitor traffic gets a 404 until the proxy lands in M3.
+/// Route one HTTP request: control upgrade on `connect.<domain>`, the apex page
+/// on the bare domain, the HTTP proxy for tunnel hostnames, else 404.
 async fn route(
     mut req: Request<hyper::body::Incoming>,
     ctx: Arc<SessionCtx>,
     config: Arc<Config>,
+    peer: std::net::SocketAddr,
     cancel: CancellationToken,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<proxy::Resp, std::convert::Infallible> {
     let host = host_of(&req);
 
     if host.as_deref() == Some(&config.connect_host()) {
         return Ok(handle_control_upgrade(&mut req, ctx, cancel));
     }
 
-    // Apex and tunnel hosts: placeholder until M3.
-    let (status, body) = if host.as_deref() == Some(config.apex()) {
-        (StatusCode::OK, config.server.apex_response.clone())
-    } else {
-        (StatusCode::NOT_FOUND, "not found".to_owned())
-    };
-    Ok(Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::from(body)))
-        .expect("static response builds"))
+    if host.as_deref() == Some(config.apex()) {
+        return Ok(proxy::page(
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            config.server.apex_response.clone(),
+        ));
+    }
+
+    match host {
+        Some(host) if config.is_tunnel_host(&host) => {
+            Ok(proxy::proxy_http(req, ctx, host, peer.ip(), peer.port()).await)
+        }
+        _ => Ok(proxy::page(
+            StatusCode::NOT_FOUND,
+            "text/plain; charset=utf-8",
+            "not found",
+        )),
+    }
 }
 
 /// Validate a WebSocket upgrade on `connect.<domain>` and, if good, spawn the
@@ -204,16 +212,24 @@ fn handle_control_upgrade(
     req: &mut Request<hyper::body::Incoming>,
     ctx: Arc<SessionCtx>,
     cancel: CancellationToken,
-) -> Response<Full<Bytes>> {
+) -> proxy::Resp {
     if req.method() != Method::GET || !is_websocket_upgrade(req) {
-        return text(StatusCode::BAD_REQUEST, "expected websocket upgrade");
+        return proxy::page(
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            "expected websocket upgrade",
+        );
     }
     let Some(accept) = req
         .headers()
         .get(SEC_WEBSOCKET_KEY)
         .map(|k| derive_accept_key(k.as_bytes()))
     else {
-        return text(StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key");
+        return proxy::page(
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            "missing Sec-WebSocket-Key",
+        );
     };
 
     let upgrade = hyper::upgrade::on(req);
@@ -228,20 +244,12 @@ fn handle_control_upgrade(
         }
     });
 
-    Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header(CONNECTION, "upgrade")
-        .header(UPGRADE, "websocket")
-        .header(SEC_WEBSOCKET_ACCEPT, accept)
-        .body(Full::new(Bytes::new()))
-        .expect("101 response builds")
-}
-
-fn text(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::from(body.to_owned())))
-        .expect("static response builds")
+    let accept_value = HeaderValue::from_str(&accept).expect("accept key is valid ascii");
+    proxy::switching_protocols(vec![
+        (CONNECTION, HeaderValue::from_static("upgrade")),
+        (UPGRADE, HeaderValue::from_static("websocket")),
+        (SEC_WEBSOCKET_ACCEPT, accept_value),
+    ])
 }
 
 /// The `Host` header, lowercased and port-stripped.

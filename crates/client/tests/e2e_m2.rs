@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ethertunnel_client::supervisor::{run_supervisor, ClientConfig, ConnState, DaemonStatus};
-use ethertunnel_client::TrustMode;
+use ethertunnel_client::{HttpTunnel, TrustMode};
 use ethertunnel_relay::auth::MemoryAuth;
 use ethertunnel_relay::config::{Config, ServerConfig, TlsConfig, TlsMode};
 use ethertunnel_relay::router::Router;
@@ -79,8 +79,11 @@ async fn daemon_connects_authenticates_and_claims() {
         relay_host: DOMAIN.to_owned(),
         relay_addr: Some(relay.local_addr),
         token: TOKEN.to_owned(),
-        hostnames: vec![HOST.to_owned()],
-        tcp_ports: vec![],
+        http_tunnels: vec![HttpTunnel {
+            hostname: HOST.to_owned(),
+            local_host: "127.0.0.1".to_owned(),
+            local_port: 0,
+        }],
         trust: TrustMode::CustomRoot(cert),
     };
 
@@ -112,8 +115,7 @@ async fn bad_token_reports_auth_failed() {
         relay_host: DOMAIN.to_owned(),
         relay_addr: Some(relay.local_addr),
         token: "etun_wrong".to_owned(),
-        hostnames: vec![],
-        tcp_ports: vec![],
+        http_tunnels: vec![],
         trust: TrustMode::CustomRoot(cert),
     };
 
@@ -152,8 +154,11 @@ async fn daemon_reclaims_after_relay_restart() {
         relay_host: DOMAIN.to_owned(),
         relay_addr: Some(addr),
         token: TOKEN.to_owned(),
-        hostnames: vec![HOST.to_owned()],
-        tcp_ports: vec![],
+        http_tunnels: vec![HttpTunnel {
+            hostname: HOST.to_owned(),
+            local_host: "127.0.0.1".to_owned(),
+            local_port: 0,
+        }],
         trust: TrustMode::CustomRoot(cert),
     };
     let (tx, mut rx) = watch::channel(DaemonStatus::default());

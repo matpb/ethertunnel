@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod config;
 pub mod listener;
+pub mod proxy;
 pub mod router;
 pub mod session;
 pub mod tls;
