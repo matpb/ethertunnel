@@ -8,9 +8,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
+use std::time::Duration;
 
-use ethertunnel_proto::frames::{ControlFrame, Resource};
-use tokio::sync::mpsc;
+use ethertunnel_proto::frames::{ControlFrame, Resource, StreamHeader};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::session::{DataStream, OpenError, SessionCmd};
 
 /// A cheap, cloneable handle to a live daemon session. Lives in the routing
 /// table; the data path clones it out under a read lock.
@@ -21,14 +24,22 @@ pub struct SessionHandle {
     /// Outgoing control frames are funneled through this channel to the
     /// session's single writer task (so writes never race).
     ctrl_tx: mpsc::Sender<ControlFrame>,
+    /// Commands to the session actor (e.g. open a data stream to the daemon).
+    cmd_tx: mpsc::Sender<SessionCmd>,
 }
 
 impl SessionHandle {
-    pub fn new(session_id: u64, user_id: i64, ctrl_tx: mpsc::Sender<ControlFrame>) -> Self {
+    pub fn new(
+        session_id: u64,
+        user_id: i64,
+        ctrl_tx: mpsc::Sender<ControlFrame>,
+        cmd_tx: mpsc::Sender<SessionCmd>,
+    ) -> Self {
         Self {
             session_id,
             user_id,
             ctrl_tx,
+            cmd_tx,
         }
     }
 
@@ -36,6 +47,21 @@ impl SessionHandle {
     /// channel drops the frame (the session is already overloaded or gone).
     pub fn send_ctrl(&self, frame: ControlFrame) {
         let _ = self.ctrl_tx.try_send(frame);
+    }
+
+    /// Open a fresh multiplexed stream to the daemon, with `header` written as
+    /// the preamble. The returned stream carries opaque bytes thereafter.
+    pub async fn open_stream(&self, header: StreamHeader) -> Result<DataStream, OpenError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCmd::OpenStream { header, reply })
+            .await
+            .map_err(|_| OpenError::SessionClosed)?;
+        match tokio::time::timeout(Duration::from_secs(5), rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(OpenError::SessionClosed),
+            Err(_) => Err(OpenError::Timeout),
+        }
     }
 }
 
@@ -165,7 +191,8 @@ mod tests {
 
     fn handle(session_id: u64, user_id: i64) -> (SessionHandle, mpsc::Receiver<ControlFrame>) {
         let (tx, rx) = mpsc::channel(16);
-        (SessionHandle::new(session_id, user_id, tx), rx)
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        (SessionHandle::new(session_id, user_id, tx, cmd_tx), rx)
     }
 
     #[test]

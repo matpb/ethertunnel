@@ -23,19 +23,45 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ethertunnel_proto::codec::{self, CodecError};
-use ethertunnel_proto::frames::{ControlFrame, DenyCode};
-use ethertunnel_proto::limits::{HELLO_TIMEOUT, MAX_CONTROL_FRAME, SESSION_DEAD_AFTER};
+use ethertunnel_proto::frames::{ControlFrame, DenyCode, StreamHeader};
+use ethertunnel_proto::limits::{
+    HELLO_TIMEOUT, MAX_CONTROL_FRAME, MAX_STREAM_HEADER, SESSION_DEAD_AFTER,
+};
 use ethertunnel_proto::transport::MuxIo;
 use ethertunnel_proto::PROTOCOL_VERSION;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::Authenticator;
 use crate::router::{Router, SessionHandle};
+
+/// A multiplexed byte stream to the daemon, tokio-flavored, with its preamble
+/// already written. The proxy paths read/write opaque bytes on it.
+pub type DataStream = Compat<yamux::Stream>;
+
+/// Why opening a data stream to the daemon failed.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The session is gone (daemon disconnected, or shutting down).
+    SessionClosed,
+    /// The actor did not produce the stream in time.
+    Timeout,
+    /// The multiplexer refused (e.g. stream limit reached).
+    Mux,
+}
+
+/// Commands the session actor services (it owns the yamux connection, so all
+/// outbound-stream opens must go through it).
+pub enum SessionCmd {
+    OpenStream {
+        header: StreamHeader,
+        reply: oneshot::Sender<Result<DataStream, OpenError>>,
+    },
+}
 
 /// Shared relay state handed to every session.
 pub struct SessionCtx {
@@ -83,30 +109,90 @@ pub async fn run_session<T>(
 {
     let session_id = ctx.next_id();
     let cancel = shutdown.child_token();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCmd>(64);
     let mut control_started = false;
+    // A command whose `poll_new_outbound` returned Pending; retried before we
+    // accept any new command (so opens are served in order, one at a time).
+    let mut pending_open: Option<SessionCmd> = None;
 
     tracing::debug!(session_id, "session started");
     loop {
-        tokio::select! {
+        // The inbound/outbound/command sources all need `&mut conn`, so they
+        // share one manual `poll_fn`; cancellation is a separate `select!`
+        // branch so its waker is registered properly (a bare `is_cancelled()`
+        // check inside the poll would never be re-polled on cancel).
+        let event = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            inbound = std::future::poll_fn(|cx| conn.poll_next_inbound(cx)) => {
-                match inbound {
-                    Some(Ok(stream)) if !control_started => {
-                        control_started = true;
-                        spawn_control(stream, ctx.clone(), session_id, cancel.clone());
+            ev = std::future::poll_fn(|cx| {
+                // Finish a pending outbound open first.
+                if pending_open.is_some() {
+                    if let std::task::Poll::Ready(result) = conn.poll_new_outbound(cx) {
+                        return std::task::Poll::Ready(Event::Opened(result));
                     }
-                    Some(Ok(_extra)) => {
-                        tracing::warn!(session_id, "daemon opened a second stream; closing");
-                        break;
+                }
+                // Drive inbound (control stream / protocol violations / close).
+                if let std::task::Poll::Ready(inbound) = conn.poll_next_inbound(cx) {
+                    return std::task::Poll::Ready(Event::Inbound(inbound));
+                }
+                // Accept a new open command only when not already busy with one.
+                if pending_open.is_none() {
+                    if let std::task::Poll::Ready(Some(cmd)) = cmd_rx.poll_recv(cx) {
+                        return std::task::Poll::Ready(Event::Command(cmd));
                     }
-                    Some(Err(e)) => {
-                        tracing::debug!(session_id, error = %e, "connection error");
-                        break;
+                }
+                std::task::Poll::Pending
+            }) => ev,
+        };
+
+        match event {
+            Event::Inbound(Some(Ok(stream))) if !control_started => {
+                control_started = true;
+                spawn_control(
+                    stream,
+                    ctx.clone(),
+                    session_id,
+                    cmd_tx.clone(),
+                    cancel.clone(),
+                );
+            }
+            Event::Inbound(Some(Ok(_extra))) => {
+                tracing::warn!(session_id, "daemon opened a second stream; closing");
+                break;
+            }
+            Event::Inbound(Some(Err(e))) => {
+                tracing::debug!(session_id, error = %e, "connection error");
+                break;
+            }
+            Event::Inbound(None) => {
+                tracing::debug!(session_id, "connection closed");
+                break;
+            }
+            Event::Command(cmd) => {
+                pending_open = Some(cmd); // serviced on the next poll
+            }
+            Event::Opened(result) => {
+                let Some(SessionCmd::OpenStream { header, reply }) = pending_open.take() else {
+                    continue;
+                };
+                match result {
+                    Ok(stream) => {
+                        // Write the preamble off-thread so the actor keeps driving.
+                        tokio::spawn(async move {
+                            let mut io = stream.compat();
+                            match codec::write_frame(&mut io, &header, MAX_STREAM_HEADER).await {
+                                Ok(()) => {
+                                    let _ = reply.send(Ok(io));
+                                }
+                                Err(_) => {
+                                    let _ = reply.send(Err(OpenError::Mux));
+                                }
+                            }
+                        });
                     }
-                    None => {
-                        tracing::debug!(session_id, "connection closed");
-                        break;
+                    Err(e) => {
+                        tracing::debug!(session_id, error = %e, "open_new_outbound failed");
+                        let _ = reply.send(Err(OpenError::Mux));
                     }
                 }
             }
@@ -118,16 +204,24 @@ pub async fn run_session<T>(
     tracing::debug!(session_id, "session ended");
 }
 
+/// Internal actor wake-up reasons.
+enum Event {
+    Inbound(Option<Result<yamux::Stream, yamux::ConnectionError>>),
+    Command(SessionCmd),
+    Opened(Result<yamux::Stream, yamux::ConnectionError>),
+}
+
 /// Spawn the control + writer tasks for a freshly accepted control stream.
 fn spawn_control(
     stream: yamux::Stream,
     ctx: Arc<SessionCtx>,
     session_id: u64,
+    cmd_tx: mpsc::Sender<SessionCmd>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
         let (mut rd, wr) = tokio::io::split(stream.compat());
-        if let Err(e) = control_task(&mut rd, wr, &ctx, session_id, &cancel).await {
+        if let Err(e) = control_task(&mut rd, wr, &ctx, session_id, &cmd_tx, &cancel).await {
             if !e.is_eof() {
                 tracing::debug!(session_id, error = %e, "control task error");
             }
@@ -142,6 +236,7 @@ async fn control_task(
     mut wr: WriteHalf<Compat<yamux::Stream>>,
     ctx: &Arc<SessionCtx>,
     session_id: u64,
+    cmd_tx: &mpsc::Sender<SessionCmd>,
     cancel: &CancellationToken,
 ) -> Result<(), CodecError> {
     // --- Handshake (writes go directly to `wr`, so they can't be lost) ---
@@ -194,7 +289,7 @@ async fn control_task(
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlFrame>(64);
     spawn_writer(wr, ctrl_rx, cancel.clone());
 
-    let handle = SessionHandle::new(session_id, user.user_id, ctrl_tx.clone());
+    let handle = SessionHandle::new(session_id, user.user_id, ctrl_tx.clone(), cmd_tx.clone());
     let _ = ctrl_tx
         .send(ControlFrame::Welcome {
             proto,
