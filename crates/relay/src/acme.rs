@@ -27,6 +27,14 @@ use tokio_util::sync::CancellationToken;
 use crate::dns_cloudflare::{Cloudflare, TxtRecord};
 use crate::tls::{self, SniResolver};
 
+/// A cached ACME account tagged with the directory it was registered against,
+/// so we never reuse a staging account in production (or vice versa).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedAccount {
+    directory: String,
+    credentials: AccountCredentials,
+}
+
 /// Renew once the leaf is within this window of expiry.
 const RENEW_BEFORE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Back-off between failed issuance attempts (boot ladder / renewal retry).
@@ -193,10 +201,18 @@ impl AcmeManager {
 
     /// Load a cached ACME account or register a new one, caching its credentials.
     async fn account(&self) -> anyhow::Result<Account> {
+        // Reuse a cached account only if it belongs to the *same* ACME directory.
+        // An account is bound to its directory, so a staging account must never
+        // be reused after switching to production (or vice versa).
         if let Ok(bytes) = std::fs::read(self.account_path()) {
-            if let Ok(creds) = serde_json::from_slice::<AccountCredentials>(&bytes) {
-                let account = Account::builder()?.from_credentials(creds).await?;
-                return Ok(account);
+            if let Ok(cached) = serde_json::from_slice::<CachedAccount>(&bytes) {
+                if cached.directory == self.directory_url {
+                    let account = Account::builder()?
+                        .from_credentials(cached.credentials)
+                        .await?;
+                    return Ok(account);
+                }
+                tracing::warn!("acme: cached account is for a different directory; re-registering");
             }
         }
         let contact = format!("mailto:{}", self.email);
@@ -213,7 +229,10 @@ impl AcmeManager {
             .await
             .context("creating ACME account")?;
         std::fs::create_dir_all(&self.state_dir).ok();
-        let json = serde_json::to_vec(&creds)?;
+        let json = serde_json::to_vec(&CachedAccount {
+            directory: self.directory_url.clone(),
+            credentials: creds,
+        })?;
         atomic_write(&self.account_path(), &json, 0o600)?;
         tracing::info!("acme: registered a new ACME account");
         Ok(account)
