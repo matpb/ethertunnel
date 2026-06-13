@@ -1,0 +1,24 @@
+[package]
+name = "ethertunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "EtherTunnel: self-hosted reverse tunnels. One binary, relay + client."
+default-run = "etun"
+
+[[bin]]
+name = "etun"
+path = "src/main.rs"
+
+[dependencies]
+ethertunnel-proto = { workspace = true }
+ethertunnel-relay = { workspace = true }
+ethertunnel-client = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

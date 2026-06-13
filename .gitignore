@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local dev artifacts
+*.pem
+*.key
+*.crt
+*.db
+*.db-wal
+*.db-shm
+/dev-state/
+.env
+.DS_Store
