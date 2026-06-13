@@ -44,6 +44,49 @@ enum Command {
         #[command(subcommand)]
         action: AdminAction,
     },
+
+    // --- client commands ---
+    /// Verify and store a bearer token for a relay.
+    Login {
+        /// Relay base domain (e.g. ethertunnel.com). Defaults to the configured relay.
+        #[arg(long)]
+        relay: Option<String>,
+        /// Read the token from stdin instead of the ETUN_TOKEN env var.
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Add (or replace) a tunnel in the client config.
+    Add {
+        /// Stable name; also the default public label.
+        name: String,
+        /// Local port to forward to.
+        port: u16,
+        /// Public label below the relay apex (HTTP; defaults to <name>).
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Make this a raw-TCP tunnel on this public relay port.
+        #[arg(long)]
+        tcp: Option<u16>,
+        /// Local host to forward to (default 127.0.0.1).
+        #[arg(long)]
+        local_host: Option<String>,
+    },
+    /// List configured tunnels.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a tunnel from the config.
+    Remove { name: String },
+    /// Run the client daemon in the foreground.
+    Up,
+    /// Show the running daemon's last published status.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose this client's ability to reach and use its relay.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -150,6 +193,32 @@ fn main() -> anyhow::Result<()> {
             domain,
             action,
         } => run_admin(config, db, domain, action),
+
+        Command::Login { relay, token_stdin } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::login(relay, token_stdin))
+        }
+        Command::Add {
+            name,
+            port,
+            hostname,
+            tcp,
+            local_host,
+        } => ethertunnel_client::commands::add(name, port, hostname, tcp, local_host),
+        Command::List { json } => ethertunnel_client::commands::list(json),
+        Command::Remove { name } => ethertunnel_client::commands::remove(name),
+        Command::Up => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::up())
+        }
+        Command::Status { json } => ethertunnel_client::commands::status(json),
+        Command::Doctor => {
+            let rt = tokio::runtime::Runtime::new()?;
+            if !rt.block_on(ethertunnel_client::doctor::run()) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
