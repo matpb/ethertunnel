@@ -30,7 +30,7 @@ async-tungstenite = "0.28"
 # TLS (rustls pinned to ring for clean musl/windows cross-compiles)
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
-rustls-pki-types = "1"
+rustls-pki-types = { version = "1", features = ["std"] }
 rcgen = "0.13"
 webpki-roots = "0.26"
 
@@ -44,7 +44,7 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 # CLI / logging / misc
 clap = { version = "4", features = ["derive", "env"] }

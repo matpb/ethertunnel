@@ -78,7 +78,9 @@ impl FileConfig {
 
 /// Extract the first certificate (DER) from a PEM blob.
 fn rustls_pemfile_first_cert(pem: &[u8]) -> anyhow::Result<Vec<u8>> {
-    rustls_pemfile::certs(&mut &pem[..])
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+    CertificateDer::pem_slice_iter(pem)
         .next()
         .and_then(|r| r.ok())
         .map(|c| c.as_ref().to_vec())

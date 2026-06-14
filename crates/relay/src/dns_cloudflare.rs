@@ -134,7 +134,7 @@ impl Cloudflare {
         }
     }
 
-    /// One DoH TXT lookup; true if any answer carries `expected`.
+    /// One DoH TXT lookup; true if any answer equals `expected` exactly.
     async fn txt_visible(&self, name: &str, expected: &str) -> anyhow::Result<bool> {
         let url = format!("{DOH}?name={name}&type=TXT");
         let req = Request::builder()
@@ -152,7 +152,7 @@ impl Cloudflare {
         Ok(answers.iter().any(|a| {
             a.get("data")
                 .and_then(|d| d.as_str())
-                .map(|d| d.trim_matches('"').contains(expected))
+                .map(|d| d.trim_matches('"') == expected)
                 .unwrap_or(false)
         }))
     }

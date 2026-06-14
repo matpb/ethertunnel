@@ -248,9 +248,19 @@ impl Config {
         format!(".{}", self.server.domain)
     }
 
-    /// True if `host` is a valid tunnel hostname under this relay (a label
-    /// directly below the apex, excluding the reserved control endpoint).
+    /// True if `host` is a valid tunnel hostname under this relay: a single,
+    /// non-reserved label directly below the apex. Excludes the control endpoint
+    /// AND every other reserved label (api, admin, www, ...), not just `connect`.
     pub fn is_tunnel_host(&self, host: &str) -> bool {
-        host != self.connect_host() && host.ends_with(&self.suffix()) && host != self.server.domain
+        if host == self.connect_host() || host == self.server.domain {
+            return false;
+        }
+        let Some(label) = host.strip_suffix(&self.suffix()) else {
+            return false;
+        };
+        if label.is_empty() || label.contains('.') {
+            return false; // apex-only or deeper than one level
+        }
+        !crate::registry::RESERVED_LABELS.contains(&label)
     }
 }

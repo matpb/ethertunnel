@@ -83,15 +83,15 @@ pub fn certified_key_from_pem(
     chain_pem: &[u8],
     key_pem: &[u8],
 ) -> anyhow::Result<Arc<CertifiedKey>> {
-    let certs = rustls_pemfile::certs(&mut &chain_pem[..])
+    use rustls::pki_types::pem::PemObject;
+    let certs = CertificateDer::pem_slice_iter(chain_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("parsing certificate chain: {e}"))?;
     if certs.is_empty() {
         anyhow::bail!("no certificates found in PEM chain");
     }
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|e| anyhow::anyhow!("parsing private key: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in PEM"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| anyhow::anyhow!("parsing private key: {e}"))?;
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| anyhow::anyhow!("unsupported private key: {e}"))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
@@ -99,7 +99,8 @@ pub fn certified_key_from_pem(
 
 /// The first certificate (DER) in a PEM chain — handy for trusting in tests.
 pub fn first_cert_der(chain_pem: &[u8]) -> anyhow::Result<Vec<u8>> {
-    rustls_pemfile::certs(&mut &chain_pem[..])
+    use rustls::pki_types::pem::PemObject;
+    CertificateDer::pem_slice_iter(chain_pem)
         .next()
         .and_then(|r| r.ok())
         .map(|c| c.as_ref().to_vec())

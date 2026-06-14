@@ -39,7 +39,7 @@ pub enum RegistryError {
 }
 
 /// Reserved labels that may never be claimed as tunnel hostnames.
-const RESERVED_LABELS: &[&str] = &["connect", "www", "admin", "api", "docs", "status", "mail"];
+pub const RESERVED_LABELS: &[&str] = &["connect", "www", "admin", "api", "docs", "status", "mail"];
 
 /// Validate a hostname label: a single DNS label, lowercase, not reserved.
 pub fn validate_label(label: &str) -> Result<(), &'static str> {
@@ -341,11 +341,18 @@ impl Registry {
         Ok(conn.execute("DELETE FROM tcp_ports WHERE port = ?1", [port])? > 0)
     }
 
-    /// Split a FQDN into its label if it sits directly under this relay's apex.
+    /// Split a FQDN into its label if it sits directly under this relay's apex
+    /// AND is a valid, non-reserved label. Authorization therefore fails closed
+    /// for reserved/malformed labels regardless of what rows exist in the DB —
+    /// defense in depth, since `validate_label` is otherwise only enforced at
+    /// admin insert time.
     fn label_of(&self, fqdn: &str) -> Option<String> {
         let label = fqdn.strip_suffix(&self.suffix)?;
         if label.is_empty() || label.contains('.') {
             return None; // deeper than one level
+        }
+        if validate_label(label).is_err() {
+            return None; // reserved or otherwise invalid
         }
         Some(label.to_owned())
     }
@@ -355,8 +362,12 @@ impl Authenticator for Registry {
     fn authenticate(&self, token: &str) -> Option<AuthedUser> {
         let hash = hash_token(token);
         let conn = self.conn.lock().unwrap();
-        // Indexed lookup over a SHA-256 of a high-entropy token; the extra
-        // constant-time compare removes any lingering timing argument.
+        // Security rests on the 256-bit OsRng token: an attacker cannot guess one,
+        // and only its SHA-256 is ever stored. The lookup matches on `token_hash`
+        // over the UNIQUE index, so the row already byte-equals `hash`; the
+        // `ct_eq` below is a belt-and-suspenders exact re-check, not a timing
+        // mitigation (any timing oracle here would leak at most a few bytes of an
+        // unguessable hash). See SECURITY_AUDIT P3-1.
         let row: (i64, String, Vec<u8>) = conn
             .query_row(
                 "SELECT u.id, u.name, t.token_hash

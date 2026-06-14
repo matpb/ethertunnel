@@ -50,19 +50,38 @@ pub fn log_file_basename() -> &'static str {
 }
 
 /// Atomically write `bytes` to `path`, applying `mode` on unix (temp + rename).
+///
+/// The temp file is created with the restrictive `mode` from the outset via
+/// `O_EXCL`, so secret bytes (tokens, keys) are never momentarily world-readable
+/// in the window before a chmod, and a pre-created temp file or symlink at the
+/// predictable temp path cannot be followed or clobbered. Permission/IO errors
+/// are propagated, never swallowed, so a secret can never be silently persisted
+/// with the wrong mode.
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    // Clear any leftover temp from a previously-crashed write so `create_new`
+    // (O_EXCL) is not blocked by our own stale file. If an attacker races a
+    // symlink in between, O_EXCL makes the create fail closed rather than follow.
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = mode;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).ok();
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
     }
     #[cfg(not(unix))]
     {
         let _ = mode;
     }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.sync_all().ok();
+    drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
 }

@@ -61,6 +61,21 @@ mod imp {
         }
     }
 
+    /// A conservative POSIX-username check. systemd units are newline-delimited
+    /// `key=value`, so an unvalidated `$USER` containing a newline could inject
+    /// arbitrary directives (e.g. `ExecStartPre=`) into the unit. We reject
+    /// anything that is not a plain username rather than escape it.
+    fn is_valid_unix_username(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 32
+            && s.bytes()
+                .next()
+                .map(|b| b.is_ascii_lowercase() || b == b'_')
+                .unwrap_or(false)
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    }
+
     fn unit_text(system: bool) -> anyhow::Result<String> {
         let exe = exe()?;
         let user_line = if system {
@@ -68,6 +83,13 @@ mod imp {
             // installing user so `--system` works without useradd, and document
             // tightening in the unit itself.
             let user = std::env::var("USER").unwrap_or_else(|_| "nobody".into());
+            if !is_valid_unix_username(&user) {
+                bail!(
+                    "refusing to install --system unit: $USER = {user:?} is not a valid \
+                     system username; set USER to a valid account (or create a dedicated \
+                     service user) before installing"
+                );
+            }
             format!("User={user}\n")
         } else {
             String::new()

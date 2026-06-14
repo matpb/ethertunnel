@@ -96,10 +96,23 @@ impl AcmeManager {
         Some((cert, key))
     }
 
-    /// Persist the issued chain+key with tight permissions on the key.
-    fn save(&self, cert_pem: &str, key_pem: &str) -> anyhow::Result<()> {
+    /// Create the state directory if needed, restricting it to the owner on unix
+    /// (`0700`) so the cached key/account never rely solely on per-file mode.
+    fn ensure_state_dir(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.state_dir)
             .with_context(|| format!("creating {}", self.state_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.state_dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", self.state_dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Persist the issued chain+key with tight permissions on the key.
+    fn save(&self, cert_pem: &str, key_pem: &str) -> anyhow::Result<()> {
+        self.ensure_state_dir()?;
         atomic_write(&self.cert_path(), cert_pem.as_bytes(), 0o644)?;
         atomic_write(&self.key_path(), key_pem.as_bytes(), 0o600)?;
         Ok(())
@@ -228,7 +241,7 @@ impl AcmeManager {
             )
             .await
             .context("creating ACME account")?;
-        std::fs::create_dir_all(&self.state_dir).ok();
+        self.ensure_state_dir()?;
         let json = serde_json::to_vec(&CachedAccount {
             directory: self.directory_url.clone(),
             credentials: creds,
@@ -334,14 +347,34 @@ impl AcmeManager {
 }
 
 /// Write `bytes` to `path` atomically (temp + rename) with the given unix mode.
-fn atomic_write(path: &std::path::Path, bytes: &[u8], _mode: u32) -> anyhow::Result<()> {
+///
+/// The temp file is created with `mode` from the outset via `O_EXCL`, so the key
+/// material is never momentarily world-readable in the window before a chmod, and
+/// a pre-created file/symlink at the predictable temp path cannot be followed.
+/// Errors are propagated rather than swallowed, so the key is never silently left
+/// at the wrong mode.
+fn atomic_write(path: &std::path::Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(_mode)).ok();
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
     }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.sync_all().ok();
+    drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
 }

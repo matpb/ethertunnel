@@ -136,6 +136,24 @@ pub async fn serve_with(
     );
     ctx.set_tcp(tcp_manager);
 
+    // Periodically reclaim idle per-IP buckets off the hot accept path, so the
+    // limiter map shrinks during quiet periods instead of only being pruned
+    // reactively at its cap under load.
+    {
+        let sweep_rate = rate.clone();
+        let sweep_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = sweep_cancel.cancelled() => break,
+                    _ = tick.tick() => sweep_rate.sweep(),
+                }
+            }
+        });
+    }
+
     let accept_cancel = cancel.clone();
     let accept_rate = rate.clone();
     tokio::spawn(async move {
