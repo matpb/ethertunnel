@@ -72,6 +72,10 @@ pub struct SessionCtx {
     /// shutdown token exist. `None` means TCP tunnels are unavailable (tests,
     /// or before installation), and TCP claims are denied.
     pub tcp: arc_swap::ArcSwapOption<crate::tcp::TcpPortManager>,
+    /// keygate entitlement gate, installed by `serve` when `[keygate]` is
+    /// configured. `None` means no enforcement (self-host / pre-billing): every
+    /// owned claim is allowed, exactly as before this integration.
+    pub entitlements: arc_swap::ArcSwapOption<crate::entitlement::EntitlementGate>,
     next_session_id: AtomicU64,
 }
 
@@ -86,6 +90,7 @@ impl SessionCtx {
             auth,
             server_version,
             tcp: arc_swap::ArcSwapOption::empty(),
+            entitlements: arc_swap::ArcSwapOption::empty(),
             next_session_id: AtomicU64::new(1),
         })
     }
@@ -93,6 +98,12 @@ impl SessionCtx {
     /// Install the raw-TCP port manager (called by `serve`).
     pub fn set_tcp(&self, manager: Arc<crate::tcp::TcpPortManager>) {
         self.tcp.store(Some(manager));
+    }
+
+    /// Install the keygate entitlement gate (called by `run_serve` when
+    /// `[keygate]` is configured).
+    pub fn set_entitlements(&self, gate: Arc<crate::entitlement::EntitlementGate>) {
+        self.entitlements.store(Some(gate));
     }
 
     fn next_id(&self) -> u64 {
@@ -403,6 +414,41 @@ async fn handle_claim(
                 })
                 .await;
             return;
+        }
+    }
+
+    // keygate entitlement enforcement. Fail-open: when no gate is installed, or
+    // the customer has no fresh cached entitlement, the claim proceeds. Only an
+    // active cap that this claim would exceed (or a suspended account) is denied.
+    if let Some(gate) = ctx.entitlements.load_full() {
+        use crate::entitlement::{now_unix, CapDecision};
+        match gate.cap_for(&user.name, now_unix()) {
+            CapDecision::Allow => {}
+            CapDecision::DenyAll => {
+                let _ = ctrl_tx
+                    .send(ControlFrame::Denied {
+                        code: DenyCode::LimitExceeded,
+                        message: "subscription does not permit new tunnels".into(),
+                    })
+                    .await;
+                return;
+            }
+            CapDecision::Cap(max) => {
+                let projected =
+                    ctx.router
+                        .projected_tunnel_count(user.user_id, &hostnames, &tcp_ports);
+                if projected as i64 > max {
+                    let _ = ctrl_tx
+                        .send(ControlFrame::Denied {
+                            code: DenyCode::LimitExceeded,
+                            message: format!(
+                                "tunnel limit reached ({max}); upgrade your plan for more"
+                            ),
+                        })
+                        .await;
+                    return;
+                }
+            }
         }
     }
 

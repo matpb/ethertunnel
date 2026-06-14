@@ -183,6 +183,43 @@ impl Router {
     pub fn hostname_count(&self) -> usize {
         self.inner.read().unwrap().http.len()
     }
+
+    /// Count the distinct active tunnels (hostnames + TCP ports) `user_id` would
+    /// hold *after* additionally claiming `new_hosts`/`new_ports`. Re-claims of
+    /// resources the user already holds do not double-count (set union). Used to
+    /// enforce a per-customer `max_tunnels` cap at claim time.
+    ///
+    /// There is an inherent ±1 race here (the count is read before the claim is
+    /// applied under a separate lock); it is accepted as benign — it can only
+    /// ever let through one extra tunnel against a quota, never wrongly deny an
+    /// owner their resources.
+    pub fn projected_tunnel_count(
+        &self,
+        user_id: i64,
+        new_hosts: &[String],
+        new_ports: &[u16],
+    ) -> usize {
+        let inner = self.inner.read().unwrap();
+        let mut hosts: HashSet<&str> = inner
+            .http
+            .iter()
+            .filter(|(_, h)| h.user_id == user_id)
+            .map(|(k, _)| k.as_str())
+            .collect();
+        for h in new_hosts {
+            hosts.insert(h.as_str());
+        }
+        let mut ports: HashSet<u16> = inner
+            .tcp
+            .iter()
+            .filter(|(_, h)| h.user_id == user_id)
+            .map(|(p, _)| *p)
+            .collect();
+        for p in new_ports {
+            ports.insert(*p);
+        }
+        hosts.len() + ports.len()
+    }
 }
 
 #[cfg(test)]

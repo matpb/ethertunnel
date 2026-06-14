@@ -13,6 +13,7 @@ pub mod auth;
 pub mod config;
 pub mod dns_cloudflare;
 pub mod doctor;
+pub mod entitlement;
 pub mod listener;
 pub mod proxy;
 pub mod ratelimit;

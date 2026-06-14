@@ -343,6 +343,43 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
         Arc::new(registry),
         env!("CARGO_PKG_VERSION").to_owned(),
     );
+
+    // Wire keygate entitlement enforcement when configured. Absent => no gate,
+    // so the relay behaves exactly as before (every owned claim allowed).
+    if let Some(kg) = &config.keygate {
+        use ethertunnel_relay::entitlement::{
+            spawn_sync, EntitlementCache, EntitlementGate, KeygateClient, KeygatePolicy,
+        };
+        let cache_path = config
+            .registry
+            .db_path
+            .parent()
+            .map(|p| p.join("keygate-cache.db"))
+            .unwrap_or_else(|| PathBuf::from("keygate-cache.db"));
+        let cache =
+            EntitlementCache::open(&cache_path).context("opening keygate entitlement cache")?;
+        let policy = KeygatePolicy {
+            product: kg.product.clone(),
+            public_key_b64: kg.public_key.clone(),
+            key_id: kg.key_id.clone(),
+            staleness_ceiling_secs: kg.staleness_ceiling_secs,
+            require_entitlement: kg.require_entitlement,
+        };
+        let gate = Arc::new(EntitlementGate::new(cache, policy));
+        ctx.set_entitlements(gate.clone());
+        let client = KeygateClient::new(kg.base_url.clone(), kg.token()?, kg.product.clone());
+        spawn_sync(
+            gate,
+            client,
+            std::time::Duration::from_secs(kg.poll_interval_secs),
+        );
+        tracing::info!(
+            base_url = %kg.base_url,
+            product = %kg.product,
+            "keygate entitlement enforcement enabled"
+        );
+    }
+
     let handle = serve(Arc::new(config), ctx).await?;
     tracing::info!(addr = %handle.local_addr, "relay running; press Ctrl-C to stop");
 

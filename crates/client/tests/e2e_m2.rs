@@ -33,6 +33,7 @@ fn relay_config(listen: SocketAddr) -> Arc<Config> {
         },
         registry: Default::default(),
         tcp: Default::default(),
+        keygate: None,
     })
 }
 

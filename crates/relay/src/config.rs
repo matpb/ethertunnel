@@ -19,6 +19,61 @@ pub struct Config {
     pub registry: RegistryConfig,
     #[serde(default)]
     pub tcp: TcpConfig,
+    /// keygate licensing integration. Absent => no entitlement enforcement.
+    #[serde(default)]
+    pub keygate: Option<KeygateConfig>,
+}
+
+/// keygate licensing integration. When present, the relay pulls signed
+/// entitlement envelopes and enforces a per-customer `max_tunnels` cap at claim
+/// time. Absent => no enforcement (self-host / pre-billing), identical to the
+/// relay's pre-integration behavior.
+#[derive(Clone, Debug, Deserialize)]
+pub struct KeygateConfig {
+    /// keygate base URL, e.g. "https://license.ethertunnel.com".
+    pub base_url: String,
+    /// File holding the consumer bearer token (kept out of the config so the
+    /// secret never lands in a world-readable file).
+    pub consumer_token_file: PathBuf,
+    /// keygate's pinned Ed25519 public key (base64, standard) for verifying
+    /// entitlement envelopes offline.
+    pub public_key: String,
+    /// The signing key id the relay accepts (rotation guard).
+    pub key_id: String,
+    /// Product key entitlements are scoped to.
+    #[serde(default = "default_keygate_product")]
+    pub product: String,
+    /// How often to pull the entitlement snapshot from keygate.
+    #[serde(default = "default_keygate_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// Honor a cached envelope at most this many seconds past its `expires_at`.
+    #[serde(default = "default_keygate_staleness_secs")]
+    pub staleness_ceiling_secs: i64,
+    /// Deny users with no fresh cached entitlement (default false: allow them
+    /// through unenforced, so unprovisioned/self-host users are never blocked).
+    #[serde(default)]
+    pub require_entitlement: bool,
+}
+
+impl KeygateConfig {
+    /// Read and trim the consumer bearer token from `consumer_token_file`.
+    pub fn token(&self) -> anyhow::Result<String> {
+        let raw = std::fs::read_to_string(&self.consumer_token_file)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.consumer_token_file.display()))?;
+        Ok(raw.trim().to_owned())
+    }
+}
+
+fn default_keygate_product() -> String {
+    "ethertunnel".to_owned()
+}
+
+fn default_keygate_poll_secs() -> u64 {
+    60
+}
+
+fn default_keygate_staleness_secs() -> i64 {
+    259_200 // 3 days
 }
 
 /// Raw-TCP tunnel settings.
