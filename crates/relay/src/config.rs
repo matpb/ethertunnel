@@ -22,6 +22,49 @@ pub struct Config {
     /// keygate licensing integration. Absent => no entitlement enforcement.
     #[serde(default)]
     pub keygate: Option<KeygateConfig>,
+    /// Connection-admission and anti-DoS limits for the public listener.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+}
+
+/// Anti-DoS admission limits for the `:443` listener. All have safe defaults so
+/// an existing config keeps working; tune them per deployment.
+#[derive(Clone, Debug, Deserialize)]
+pub struct LimitsConfig {
+    /// Hard ceiling on concurrent connections process-wide. Bounds fd/memory
+    /// exhaustion; excess connections are dropped at accept.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Max concurrent connections per source key (IPv6 is keyed by /64, so a
+    /// single allocation can't bypass this by rotating addresses).
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+    /// Deadline for a visitor to finish sending its HTTP request headers after
+    /// the TLS handshake. Bounds slowloris; 0 disables.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_max_connections(),
+            max_connections_per_ip: default_max_connections_per_ip(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
+        }
+    }
+}
+
+fn default_max_connections() -> usize {
+    4096
+}
+
+fn default_max_connections_per_ip() -> u32 {
+    64
+}
+
+fn default_header_read_timeout_secs() -> u64 {
+    10
 }
 
 /// keygate licensing integration. When present, the relay pulls signed

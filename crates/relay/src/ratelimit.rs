@@ -5,9 +5,28 @@
 //! a dependency; the map is swept and capped so it cannot grow without bound.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::Mutex;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// Collapse an address to its limiter key. IPv6 is masked to its /64 — the
+/// smallest block routinely assigned to a single subscriber — so an attacker
+/// with a /64 (or larger) cannot mint unlimited distinct keys by rotating the
+/// host bits. IPv4 is used whole.
+pub fn limiter_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            for b in octets.iter_mut().skip(8) {
+                *b = 0;
+            }
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
+}
 
 struct Bucket {
     tokens: f64,
@@ -33,8 +52,9 @@ impl RateLimiter {
     }
 
     /// Try to admit a connection from `ip`. Returns false if the bucket is dry.
+    /// The address is collapsed via [`limiter_key`] so IPv6 is throttled per /64.
     pub fn check(&self, ip: IpAddr) -> bool {
-        self.check_at(ip, Instant::now())
+        self.check_at(limiter_key(ip), Instant::now())
     }
 
     fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
@@ -77,6 +97,68 @@ impl RateLimiter {
     }
 }
 
+/// Bounds the number of *concurrent* live connections, process-wide and per
+/// source key, complementing the accept-*rate* [`RateLimiter`]. A rate limit
+/// alone can't stop a flood of slow-but-established connections from exhausting
+/// fds/memory; this can. Per-key counts use the same /64-collapsed key as the
+/// rate limiter, so IPv6 rotation can't bypass the per-source cap either.
+pub struct ConnLimiter {
+    global: Arc<Semaphore>,
+    per_key: Mutex<HashMap<IpAddr, u32>>,
+    per_key_max: u32,
+}
+
+impl ConnLimiter {
+    pub fn new(global_max: usize, per_key_max: u32) -> Arc<Self> {
+        // `Semaphore::MAX_PERMITS` is huge; a 0 config would wedge the relay, so
+        // clamp to at least 1.
+        let global_max = global_max.clamp(1, Semaphore::MAX_PERMITS);
+        Arc::new(Self {
+            global: Arc::new(Semaphore::new(global_max)),
+            per_key: Mutex::new(HashMap::new()),
+            per_key_max: per_key_max.max(1),
+        })
+    }
+
+    /// Try to admit a connection from `ip`. Returns a permit that releases both
+    /// the global slot and the per-key count when dropped, or `None` if either
+    /// the global or the per-key ceiling is already reached.
+    pub fn try_admit(self: &Arc<Self>, ip: IpAddr) -> Option<ConnPermit> {
+        let global = Arc::clone(&self.global).try_acquire_owned().ok()?;
+        let key = limiter_key(ip);
+        let mut map = self.per_key.lock().unwrap();
+        let count = map.entry(key).or_insert(0);
+        if *count >= self.per_key_max {
+            return None; // `global` drops here, releasing the slot it took
+        }
+        *count += 1;
+        Some(ConnPermit {
+            _global: global,
+            limiter: Arc::clone(self),
+            key,
+        })
+    }
+}
+
+/// Held for a connection's lifetime; releases its global + per-key slot on drop.
+pub struct ConnPermit {
+    _global: OwnedSemaphorePermit,
+    limiter: Arc<ConnLimiter>,
+    key: IpAddr,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        let mut map = self.limiter.per_key.lock().unwrap();
+        if let Some(count) = map.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +194,52 @@ mod tests {
         assert!(rl.check_at(a, t));
         assert!(!rl.check_at(a, t)); // a is dry
         assert!(rl.check_at(b, t)); // b is independent
+    }
+
+    #[test]
+    fn ipv6_collapses_to_slash_64() {
+        use std::net::Ipv6Addr;
+        let a: IpAddr = "2001:db8:abcd:1::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:abcd:1:ffff:ffff:ffff:ffff".parse().unwrap();
+        let other: IpAddr = "2001:db8:abcd:2::1".parse().unwrap();
+        // Same /64 -> same key; different /64 -> different key.
+        assert_eq!(limiter_key(a), limiter_key(b));
+        assert_ne!(limiter_key(a), limiter_key(other));
+        // The key zeroes the host bits.
+        assert_eq!(
+            limiter_key(a),
+            IpAddr::V6("2001:db8:abcd:1::".parse::<Ipv6Addr>().unwrap())
+        );
+        // IPv4 is untouched.
+        let v4 = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
+        assert_eq!(limiter_key(v4), v4);
+    }
+
+    #[test]
+    fn conn_limiter_global_and_per_key_caps() {
+        // Global cap 3, per-key cap 2.
+        let cl = ConnLimiter::new(3, 2);
+        let a1: IpAddr = "2001:db8:1:1::1".parse().unwrap();
+        let a2: IpAddr = "2001:db8:1:1::2".parse().unwrap(); // same /64 as a1
+        let b: IpAddr = "203.0.113.7".parse().unwrap();
+
+        let p1 = cl.try_admit(a1).expect("1st from a");
+        let p2 = cl.try_admit(a2).expect("2nd from a's /64");
+        // Per-key cap (2) reached for a's /64, even from a different host bit.
+        assert!(
+            cl.try_admit(a1).is_none(),
+            "per-key cap should block a's 3rd"
+        );
+
+        let _p3 = cl
+            .try_admit(b)
+            .expect("1st from b fills the global cap (3)");
+        // Global cap (3) reached.
+        assert!(cl.try_admit(b).is_none(), "global cap should block the 4th");
+
+        // Dropping a permit frees both a global slot and a per-key slot.
+        drop(p1);
+        let _p4 = cl.try_admit(b).expect("slot freed -> b admitted");
+        drop(p2);
     }
 }

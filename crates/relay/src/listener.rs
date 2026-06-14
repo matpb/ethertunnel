@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::proxy;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{ConnLimiter, ConnPermit, RateLimiter};
 use crate::session::{run_session, SessionCtx};
 use crate::tcp::TcpPortManager;
 use crate::tls::{self, SniResolver};
@@ -125,8 +125,13 @@ pub async fn serve_with(
     let local_addr = listener.local_addr()?;
     let domain = config.server.domain.clone();
 
-    // Per-IP accept limiter (pre-TLS) and the raw-TCP tunnel port manager.
+    // Per-IP accept-*rate* limiter (pre-TLS), the concurrent-*connection* cap,
+    // and the raw-TCP tunnel port manager.
     let rate = Arc::new(RateLimiter::new(20, 40));
+    let conn_limiter = ConnLimiter::new(
+        config.limits.max_connections,
+        config.limits.max_connections_per_ip,
+    );
     let tcp_manager = TcpPortManager::new(
         local_addr.ip(),
         config.tcp.port_range,
@@ -156,6 +161,7 @@ pub async fn serve_with(
 
     let accept_cancel = cancel.clone();
     let accept_rate = rate.clone();
+    let accept_conns = conn_limiter.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -168,12 +174,20 @@ pub async fn serve_with(
                             drop(stream);
                         }
                         Ok((stream, peer)) => {
+                            // Hold a concurrency slot for the whole connection;
+                            // None => global or per-source ceiling reached.
+                            let Some(permit) = accept_conns.try_admit(peer.ip()) else {
+                                tracing::debug!(%peer, "connection cap reached; dropping connection");
+                                drop(stream);
+                                continue;
+                            };
                             let acceptor = acceptor.clone();
                             let ctx = ctx.clone();
                             let config = config.clone();
                             let conn_cancel = accept_cancel.clone();
                             tokio::spawn(async move {
-                                handle_conn(stream, peer, acceptor, ctx, config, conn_cancel).await;
+                                handle_conn(stream, peer, acceptor, ctx, config, conn_cancel, permit)
+                                    .await;
                             });
                         }
                         Err(e) => {
@@ -201,6 +215,11 @@ async fn handle_conn(
     ctx: Arc<SessionCtx>,
     config: Arc<Config>,
     cancel: CancellationToken,
+    // Held until this connection's pre-upgrade HTTP exchange ends (or the whole
+    // keep-alive connection for plain visitor traffic), releasing the
+    // concurrency slot on drop. Established daemon sessions outlive this — they
+    // are bounded instead by auth + the pre-control-stream deadline + dead-man.
+    _permit: ConnPermit,
 ) {
     let _ = stream.set_nodelay(true);
     let tls = match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await {
@@ -215,6 +234,7 @@ async fn handle_conn(
         }
     };
 
+    let header_read_timeout_secs = config.limits.header_read_timeout_secs;
     let service = {
         let cancel = cancel.clone();
         service_fn(move |req| {
@@ -225,7 +245,17 @@ async fn handle_conn(
         })
     };
 
-    let conn = hyper::server::conn::http1::Builder::new()
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    // Bound slowloris: cap how long a client may take to send its request line +
+    // headers after the TLS handshake. The route()/auth logic only runs once the
+    // headers arrive, so without this an unauthenticated peer could stall forever.
+    // hyper requires a Timer to be installed for header_read_timeout to work.
+    if header_read_timeout_secs > 0 {
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(header_read_timeout_secs));
+    }
+    let conn = builder
         .serve_connection(TokioIo::new(tls), service)
         .with_upgrades();
 

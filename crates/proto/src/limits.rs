@@ -41,3 +41,9 @@ pub const SESSION_DEAD_AFTER: Duration = Duration::from_secs(90);
 
 /// A daemon must send `Hello` within this window of opening the control stream.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max number of resources (hostnames + tcp_ports) a single `Claim` may carry.
+/// A 64 KiB control frame can otherwise pack thousands of tiny entries, each of
+/// which the relay lowercases and ownership-checks; this bounds that per-claim
+/// work. A daemon needing more simply sends additional claims.
+pub const MAX_CLAIM_ENTRIES: usize = 256;

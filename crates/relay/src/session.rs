@@ -136,6 +136,14 @@ pub async fn run_session<T>(
     // accept any new command (so opens are served in order, one at a time).
     let mut pending_open: Option<SessionCmd> = None;
 
+    // Pre-auth deadline: a peer that completes the WebSocket upgrade but never
+    // opens the control stream would otherwise park this actor (and its yamux
+    // connection) indefinitely, since `control_started` never flips. Tear the
+    // session down if no control stream arrives within HELLO_TIMEOUT. Once the
+    // stream is up, the handshake/heartbeat timeouts in `control_task` take over.
+    let control_deadline = tokio::time::sleep(HELLO_TIMEOUT);
+    tokio::pin!(control_deadline);
+
     tracing::debug!(session_id, "session started");
     loop {
         // The inbound/outbound/command sources all need `&mut conn`, so they
@@ -145,6 +153,10 @@ pub async fn run_session<T>(
         let event = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            _ = &mut control_deadline, if !control_started => {
+                tracing::debug!(session_id, "no control stream before deadline; closing");
+                break;
+            }
             ev = std::future::poll_fn(|cx| {
                 // Finish a pending outbound open first.
                 if pending_open.is_some() {
@@ -371,6 +383,22 @@ async fn handle_claim(
     tcp_ports: Vec<u16>,
     ctrl_tx: &mpsc::Sender<ControlFrame>,
 ) {
+    // Bound per-claim work: a 64 KiB control frame can pack thousands of tiny
+    // entries, each of which we lowercase and ownership-check. Reject oversized
+    // claims outright; a daemon needing more sends additional claims.
+    if hostnames.len() + tcp_ports.len() > ethertunnel_proto::limits::MAX_CLAIM_ENTRIES {
+        let _ = ctrl_tx
+            .send(ControlFrame::Denied {
+                code: DenyCode::ProtocolError,
+                message: format!(
+                    "claim too large (max {} entries)",
+                    ethertunnel_proto::limits::MAX_CLAIM_ENTRIES
+                ),
+            })
+            .await;
+        return;
+    }
+
     let hostnames: Vec<String> = hostnames.iter().map(|h| h.to_ascii_lowercase()).collect();
 
     // All-or-nothing ownership check before mutating any route.
@@ -651,6 +679,31 @@ mod tests {
             other => panic!("expected Denied, got {other:?}"),
         }
         assert!(router.lookup_http("someone-else.ethertunnel.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_claim_is_denied() {
+        use ethertunnel_proto::limits::MAX_CLAIM_ENTRIES;
+        let (ctx, router, _auth, _uid) = fixture();
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        // One past the cap; all bogus, but the cap check fires before ownership.
+        let hostnames: Vec<String> = (0..=MAX_CLAIM_ENTRIES)
+            .map(|i| format!("h{i}.ethertunnel.com"))
+            .collect();
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames,
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Denied { code, .. } => assert_eq!(code, DenyCode::ProtocolError),
+            other => panic!("expected Denied(ProtocolError), got {other:?}"),
+        }
+        assert!(router.lookup_http("h0.ethertunnel.com").is_none());
     }
 
     #[tokio::test]
