@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/proto", "crates/relay", "crates/client", "crates/cli"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["Mat <bourgeois.mat@gmail.com>"]
@@ -48,6 +48,7 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 # CLI / logging / misc
 clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

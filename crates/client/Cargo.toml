@@ -23,6 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+rpassword = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 directories = "6"

@@ -48,7 +48,7 @@ enum Command {
     // --- client commands ---
     /// Verify and store a bearer token for a relay.
     Login {
-        /// Relay base domain (e.g. ethertunnel.com). Defaults to the configured relay.
+        /// Relay base domain (e.g. ethertunnel.com). Defaults to the configured relay, or ethertunnel.com.
         #[arg(long)]
         relay: Option<String>,
         /// Read the token from stdin instead of the ETUN_TOKEN env var.

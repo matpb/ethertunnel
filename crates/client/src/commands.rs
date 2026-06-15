@@ -2,7 +2,7 @@
 //! parses arguments and calls these, so the behaviour is testable and the binary
 //! stays a thin dispatcher.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
 use anyhow::{bail, Context};
 use tokio::sync::watch;
@@ -13,12 +13,24 @@ use crate::status::StatusSnapshot;
 use crate::supervisor::{run_supervisor, ConnState, DaemonStatus};
 use crate::{creds, login};
 
+/// Hosted relay used when neither --relay nor a configured relay is present.
+/// Baking this here makes `etun login` work out-of-the-box against the hosted
+/// service; self-hosters override it by passing --relay <their-domain> once
+/// (it is then persisted to config and reused).
+pub const DEFAULT_RELAY: &str = "ethertunnel.com";
+
+/// Resolve the relay to use: an explicit `--relay` wins, then a non-empty
+/// configured relay, and finally [`DEFAULT_RELAY`] as the zero-config fallback.
+fn resolve_relay(arg: Option<String>, configured: &str) -> String {
+    arg.or_else(|| (!configured.is_empty()).then(|| configured.to_owned()))
+        .unwrap_or_else(|| DEFAULT_RELAY.to_owned())
+}
+
 /// `etun login` — verify and store a bearer token for a relay.
 pub async fn login(relay: Option<String>, token_stdin: bool) -> anyhow::Result<()> {
     let mut cfg = FileConfig::load()?;
-    let relay = relay
-        .or_else(|| (!cfg.relay.is_empty()).then(|| cfg.relay.clone()))
-        .context("no relay set; pass --relay <domain>")?;
+    let used_default = relay.is_none() && cfg.relay.is_empty();
+    let relay = resolve_relay(relay, &cfg.relay);
 
     let token = if token_stdin {
         let mut s = String::new();
@@ -28,6 +40,11 @@ pub async fn login(relay: Option<String>, token_stdin: bool) -> anyhow::Result<(
         s.trim().to_owned()
     } else if let Ok(env) = std::env::var("ETUN_TOKEN") {
         env
+    } else if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("Paste your EtherTunnel token: ")
+            .context("reading token from terminal")?
+            .trim()
+            .to_owned()
     } else {
         bail!("provide the token via --token-stdin or the ETUN_TOKEN env var");
     };
@@ -35,6 +52,9 @@ pub async fn login(relay: Option<String>, token_stdin: bool) -> anyhow::Result<(
         bail!("empty token");
     }
 
+    if used_default {
+        eprintln!("No relay set; defaulting to ethertunnel.com. Self-hosters: etun login --relay <your-domain>.");
+    }
     println!("Verifying token against connect.{relay} ...");
     let ok = login::verify(&relay, &token, &cfg.trust_mode()?).await?;
     creds::store(&relay, &token)?;
@@ -262,4 +282,27 @@ pub async fn up() -> anyhow::Result<()> {
     let _ = supervisor.await;
     publisher.abort();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_relay_is_hosted_domain() {
+        assert_eq!(DEFAULT_RELAY, "ethertunnel.com");
+    }
+
+    #[test]
+    fn relay_precedence_arg_beats_config_and_default() {
+        // Explicit --relay always wins.
+        assert_eq!(
+            resolve_relay(Some("arg.example".to_owned()), "cfg.example"),
+            "arg.example"
+        );
+        // A configured relay beats the baked-in default.
+        assert_eq!(resolve_relay(None, "cfg.example"), "cfg.example");
+        // Nothing set falls back to the hosted default.
+        assert_eq!(resolve_relay(None, ""), DEFAULT_RELAY);
+    }
 }
