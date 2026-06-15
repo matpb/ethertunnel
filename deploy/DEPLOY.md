@@ -65,6 +65,74 @@ The relay issues a real Let's Encrypt wildcard and hot-swaps it on renewal.
 
 Hand the token to the client: `etun login --relay ethertunnel.com --token-stdin`.
 
+## Client (--system) install
+
+The per-user install (`etun service install`, no flag) needs nothing beyond
+`etun login` — it runs as your login user and reads `~/.config/etun`. The
+`--system` install runs the client daemon under a hardened systemd unit with
+`DynamicUser=yes` + `StateDirectory=etun`, so systemd allocates a locked-down
+transient service user and creates `/var/lib/etun` owned by it — there is **no**
+`useradd` and no stable uid. Two pieces of state cross into that sandbox:
+
+- the **bearer token** (the secret) is bridged in via systemd `LoadCredential`
+  from a root-owned file — it never touches the DynamicUser-owned disk;
+- the **relay host** (not a secret) is seeded once into `config.toml` inside the
+  StateDirectory.
+
+`etun service install --system` writes the unit, creates `/etc/etun` and
+`/var/lib/etun`, and **enables but does not start** the service — because the
+hardened unit must be provisioned first (`LoadCredential` makes `/etc/etun/token`
+mandatory: systemd refuses to start the unit without it). Provision the two
+pieces, then start once. No crash-loop, no stop/seed/start dance.
+
+**a. (as your user) Mint the token, exactly as for a per-user setup:**
+
+    etun login --relay <relay-host> --token-stdin   # writes ~/.config/etun/{config.toml,credentials.toml}
+
+**b. (as root) Install the service** (writes the unit + creates the dirs, enabled
+but not started):
+
+    sudo etun service install --system
+
+**c. (as root) Place the bearer token outside the sandbox.** Copy the value
+stored under `[tokens]."<relay-host>"` in `~/.config/etun/credentials.toml`:
+
+    printf '%s' "<TOKEN>" | sudo install -D -m 0600 -o root -g root /dev/stdin /etc/etun/token
+
+`/etc/etun/token` is **root:root 0600**. systemd reads it as root at start and
+copies it into a private per-uid tmpfs (mode 0400) that only the transient
+service user can read; the daemon picks it up via `ETUN_TOKEN_FILE`. The token
+never lands in `/var/lib/etun`.
+
+**d. (as root) Seed the non-secret config** (relay host + any tunnels) into the
+StateDirectory at mode 0644 so the transient service user can read it:
+
+    printf 'relay = "<relay-host>"\n' | sudo install -m 0644 /dev/stdin /var/lib/etun/config.toml
+
+`config.toml` carries no secret (just `relay = "..."` and your tunnel
+definitions); 0644 is fine and is readable whatever uid systemd assigns.
+
+**e. (as root) Start and verify:**
+
+    sudo systemctl start etun.service
+    sudo systemctl status etun.service
+    journalctl -u etun.service
+
+**To rotate the token:** overwrite `/etc/etun/token`, then
+`sudo systemctl restart etun.service` (the tmpfs credential is re-copied each
+start).
+
+**systemd version note:** `LoadCredential=` and the `%d`/`$CREDENTIALS_DIRECTORY`
+expansion require **systemd 247+** (shipped by Ubuntu 22.04+, Debian 12+, and
+RHEL/Alma 9). On systemd 235–246, skip step (c) and instead supply the token via
+a drop-in — `sudo systemctl edit etun.service` and add:
+
+    [Service]
+    Environment=ETUN_TOKEN=<TOKEN>
+
+The daemon's `ETUN_TOKEN_FILE` read is best-effort, so it falls through cleanly
+to the `ETUN_TOKEN` env value.
+
 ## Backups
 
 The registry is SQLite (WAL). Back it up live with:

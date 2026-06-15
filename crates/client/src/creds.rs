@@ -1,8 +1,10 @@
 //! Bearer-token storage, kept apart from the shareable config.
 //!
 //! Tokens live in `credentials.toml` (0600 on unix), keyed by relay host so one
-//! machine can hold credentials for several relays. The env var `ETUN_TOKEN`
-//! overrides the file (handy for CI and `--system` services).
+//! machine can hold credentials for several relays. `ETUN_TOKEN_FILE` (a path,
+//! used by `--system` services via systemd `LoadCredential`) takes precedence
+//! over `ETUN_TOKEN` (an inline value, handy for CI), which in turn overrides
+//! the file.
 
 use std::collections::BTreeMap;
 
@@ -43,8 +45,19 @@ pub fn store(relay: &str, token: &str) -> anyhow::Result<()> {
     file.save()
 }
 
-/// Resolve the token for `relay`: `ETUN_TOKEN` env wins, else the file.
+/// Resolve the token for `relay`: `ETUN_TOKEN_FILE` (path) wins, then the
+/// `ETUN_TOKEN` env value, else the file keyed by relay.
 pub fn resolve(relay: &str) -> anyhow::Result<Option<String>> {
+    if let Ok(p) = std::env::var("ETUN_TOKEN_FILE") {
+        if !p.is_empty() {
+            if let Ok(tok) = std::fs::read_to_string(&p) {
+                let tok = tok.trim();
+                if !tok.is_empty() {
+                    return Ok(Some(tok.to_owned()));
+                }
+            }
+        }
+    }
     if let Ok(env) = std::env::var("ETUN_TOKEN") {
         if !env.is_empty() {
             return Ok(Some(env));

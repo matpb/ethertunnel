@@ -61,61 +61,99 @@ mod imp {
         }
     }
 
-    /// A conservative POSIX-username check. systemd units are newline-delimited
-    /// `key=value`, so an unvalidated `$USER` containing a newline could inject
-    /// arbitrary directives (e.g. `ExecStartPre=`) into the unit. We reject
-    /// anything that is not a plain username rather than escape it.
-    fn is_valid_unix_username(s: &str) -> bool {
-        !s.is_empty()
-            && s.len() <= 32
-            && s.bytes()
-                .next()
-                .map(|b| b.is_ascii_lowercase() || b == b'_')
-                .unwrap_or(false)
-            && s.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
-    }
+    /// The hardened `--system` unit body. `DynamicUser=yes` supplies a
+    /// locked-down transient service identity (no `useradd`, no `User=` to
+    /// interpolate), `StateDirectory=etun` creates /var/lib/etun owned by it,
+    /// and the bearer token is bridged into the sandbox via `LoadCredential`
+    /// (never landing on the DynamicUser-owned disk). The only substituted
+    /// value is `{exe}`, an absolute path from current_exe() — not
+    /// attacker-controlled — so no escaping/validation is required.
+    const SYSTEM_BODY: &str = "\
+[Unit]\n\
+Description=EtherTunnel client daemon\n\
+Documentation=https://github.com/matpb/ethertunnel\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart={exe} up --service-mode\n\
+Restart=always\n\
+RestartSec=5\n\
+\n\
+# --- Identity & state (no useradd side effect) ---\n\
+# systemd allocates a locked-down transient service user for the lifetime of\n\
+# the unit and creates /var/lib/etun owned by it (%S expands to /var/lib).\n\
+DynamicUser=yes\n\
+StateDirectory=etun\n\
+StateDirectoryMode=0700\n\
+# Point the client's config-dir resolver (paths::config_dir, ETUN_CONFIG_DIR\n\
+# wins) at the RW StateDirectory: the daemon reads config.toml and writes\n\
+# credentials.toml / status.json / logs/ there.\n\
+Environment=ETUN_CONFIG_DIR=%S/etun\n\
+\n\
+# --- Bearer token (never lands in the DynamicUser-owned state dir) ---\n\
+# Operator provisions the raw token at /etc/etun/token (root:root 0600).\n\
+# systemd, running as root before dropping privileges, copies it into a private\n\
+# tmpfs at $CREDENTIALS_DIRECTORY/token (mode 0400, readable only by the\n\
+# transient uid). ETUN_TOKEN_FILE points the daemon's creds resolver at it.\n\
+# %d == $CREDENTIALS_DIRECTORY.\n\
+LoadCredential=token:/etc/etun/token\n\
+Environment=ETUN_TOKEN_FILE=%d/token\n\
+\n\
+# --- Hardening (mirrors deploy/etun-relay.service; tightened for an egress-only client) ---\n\
+NoNewPrivileges=true\n\
+ProtectSystem=strict\n\
+ProtectHome=true\n\
+PrivateTmp=true\n\
+ProtectKernelTunables=true\n\
+ProtectKernelModules=true\n\
+ProtectControlGroups=true\n\
+RestrictNamespaces=true\n\
+RestrictSUIDSGID=true\n\
+RestrictRealtime=true\n\
+LockPersonality=true\n\
+MemoryDenyWriteExecute=true\n\
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
+SystemCallFilter=@system-service\n\
+SystemCallErrorNumber=EPERM\n\
+# Userspace TLS client: binds no privileged ports, needs no capabilities.\n\
+CapabilityBoundingSet=\n\
+AmbientCapabilities=\n\
+LimitNOFILE=65536\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n";
 
     fn unit_text(system: bool) -> anyhow::Result<String> {
         let exe = exe()?;
-        let user_line = if system {
-            // A real deployment would run as a dedicated user; default to the
-            // installing user so `--system` works without useradd, and document
-            // tightening in the unit itself.
-            let user = std::env::var("USER").unwrap_or_else(|_| "nobody".into());
-            if !is_valid_unix_username(&user) {
-                bail!(
-                    "refusing to install --system unit: $USER = {user:?} is not a valid \
-                     system username; set USER to a valid account (or create a dedicated \
-                     service user) before installing"
-                );
-            }
-            format!("User={user}\n")
+        if system {
+            // Hardened system unit: DynamicUser supplies the identity, so there
+            // is no `$USER` interpolation (and thus nothing to validate). The
+            // only substituted value is the absolute binary path.
+            Ok(SYSTEM_BODY.replace("{exe}", &exe))
         } else {
-            String::new()
-        };
-        Ok(format!(
-            "[Unit]\n\
-             Description=EtherTunnel client daemon\n\
-             After=network-online.target\n\
-             Wants=network-online.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart={exe} up --service-mode\n\
-             Restart=always\n\
-             RestartSec=5\n\
-             {user_line}\
-             NoNewPrivileges=true\n\
-             \n\
-             [Install]\n\
-             WantedBy={target}\n",
-            target = if system {
-                "multi-user.target"
-            } else {
-                "default.target"
-            },
-        ))
+            // Per-user unit: runs as the unprivileged login user, which already
+            // owns ~/.config/etun. Deliberately NO DynamicUser/StateDirectory/
+            // ProtectHome here — ProtectHome=true would hide ~/.config/etun and
+            // break the per-user credential path. Emit today's text verbatim.
+            Ok(format!(
+                "[Unit]\n\
+                 Description=EtherTunnel client daemon\n\
+                 After=network-online.target\n\
+                 Wants=network-online.target\n\
+                 \n\
+                 [Service]\n\
+                 Type=simple\n\
+                 ExecStart={exe} up --service-mode\n\
+                 Restart=always\n\
+                 RestartSec=5\n\
+                 NoNewPrivileges=true\n\
+                 \n\
+                 [Install]\n\
+                 WantedBy=default.target\n",
+            ))
+        }
     }
 
     fn systemctl(system: bool, args: &[&str]) -> anyhow::Result<()> {
@@ -136,13 +174,35 @@ mod imp {
             .with_context(|| format!("writing {}", path.display()))?;
         println!("wrote {}", path.display());
         systemctl(system, &["daemon-reload"])?;
-        // enable-linger lets a user service keep running after logout.
-        if !system {
-            if let Ok(user) = std::env::var("USER") {
-                let _ = Command::new("loginctl")
-                    .args(["enable-linger", &user])
-                    .status();
-            }
+
+        if system {
+            // The hardened --system unit must be provisioned BEFORE its first
+            // start: `LoadCredential=token:/etc/etun/token` makes that file
+            // mandatory (systemd refuses to start the unit if it's missing), and
+            // the daemon needs config.toml (relay + tunnels) in its
+            // StateDirectory. We pre-create both dirs as root so the operator can
+            // seed them, `enable` WITHOUT `--now`, and print the seed steps. A
+            // single clean `systemctl start` follows — no unconfigured auto-start
+            // crash-loop, and no stop/seed/start dance.
+            std::fs::create_dir_all("/etc/etun").context("creating /etc/etun")?;
+            std::fs::create_dir_all("/var/lib/etun").context("creating /var/lib/etun")?;
+            systemctl(system, &["enable", "etun.service"])?;
+            println!(
+                "etun --system unit installed (enabled, not started yet).\n\
+                 Finish provisioning, then start:\n  \
+                 1. token:  printf %s '<TOKEN>' | install -m 600 /dev/stdin /etc/etun/token\n  \
+                 2. config: write /var/lib/etun/config.toml (mode 0644), e.g.  relay = \"<relay-host>\"\n  \
+                 3. start:  systemctl start etun.service\n\
+                 Full guide: deploy/DEPLOY.md (Client --system install)."
+            );
+            return Ok(());
+        }
+
+        // Per-user: enable-linger lets the service keep running after logout.
+        if let Ok(user) = std::env::var("USER") {
+            let _ = Command::new("loginctl")
+                .args(["enable-linger", &user])
+                .status();
         }
         systemctl(system, &["enable", "--now", "etun.service"])?;
         println!("etun service installed and started");
