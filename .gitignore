@@ -4,6 +4,11 @@ Cargo.lock.bak
 
 # Local dev artifacts
 MONETIZATION_DEV_STATUS.md
+# Internal security audits + scratch workflow/PoC scripts — never publish
+SECURITY_AUDIT_*
+*.workflow.js
+.*-workflow.js
+poc_*.py
 *.pem
 *.key
 *.crt
