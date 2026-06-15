@@ -15,6 +15,22 @@ pub struct AuthedUser {
     pub name: String,
 }
 
+/// Outcome of an attempt to claim (self-register) a hostname under this relay's
+/// apex. Returned by [`Authenticator::claim_hostname`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The label is now owned by this user — either it was free and we
+    /// registered it, or it was already theirs (idempotent).
+    Owned,
+    /// The label is owned by a *different* user; the claim is refused.
+    Taken,
+    /// The hostname is not a valid claimable label under this relay (wrong apex,
+    /// too deep, reserved, or malformed). The string is a human-readable reason.
+    Invalid(&'static str),
+    /// A storage error occurred; the claim could not be completed.
+    Error,
+}
+
 /// Resolves tokens to users and answers ownership questions for hostnames and
 /// TCP ports. Implementations must be cheap and side-effect free.
 pub trait Authenticator: Send + Sync + 'static {
@@ -27,6 +43,21 @@ pub trait Authenticator: Send + Sync + 'static {
 
     /// Whether `user_id` may claim the given public TCP port.
     fn owns_port(&self, user_id: i64, port: u16) -> bool;
+
+    /// Self-register `hostname` to `user_id` from the global label pool
+    /// (first-come-first-served), or confirm the user already owns it.
+    ///
+    /// The default implementation preserves the legacy "labels are
+    /// admin-pre-registered" behavior: it never creates a label, only reporting
+    /// `Owned` for one the user already holds, `Taken` otherwise. The SQLite
+    /// registry overrides this to actually claim a free label.
+    fn claim_hostname(&self, user_id: i64, hostname: &str) -> ClaimOutcome {
+        if self.owns_hostname(user_id, hostname) {
+            ClaimOutcome::Owned
+        } else {
+            ClaimOutcome::Taken
+        }
+    }
 }
 
 /// An in-memory `Authenticator` for tests and early milestones.
@@ -110,5 +141,26 @@ impl Authenticator for MemoryAuth {
             .ports
             .get(&user_id)
             .is_some_and(|s| s.contains(&port))
+    }
+
+    fn claim_hostname(&self, user_id: i64, hostname: &str) -> ClaimOutcome {
+        let mut g = self.inner.lock().unwrap();
+        // Owned by someone? Decide based on who.
+        let owner = g
+            .hostnames
+            .iter()
+            .find(|(_, set)| set.contains(hostname))
+            .map(|(uid, _)| *uid);
+        match owner {
+            Some(uid) if uid == user_id => ClaimOutcome::Owned,
+            Some(_) => ClaimOutcome::Taken,
+            None => {
+                g.hostnames
+                    .entry(user_id)
+                    .or_default()
+                    .insert(hostname.to_owned());
+                ClaimOutcome::Owned
+            }
+        }
     }
 }

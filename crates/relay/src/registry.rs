@@ -17,7 +17,7 @@ use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::auth::{AuthedUser, Authenticator};
+use crate::auth::{AuthedUser, Authenticator, ClaimOutcome};
 
 /// Errors from registry operations.
 #[derive(Debug, thiserror::Error)]
@@ -222,6 +222,123 @@ impl Registry {
         Ok(())
     }
 
+    /// Provision (idempotently) a user by name and mint a fresh bearer token.
+    ///
+    /// Used by the keygate-driven self-serve provisioning endpoint. The user is
+    /// created if absent (returning `created = true`) or reused if it already
+    /// exists (`created = false`); in both cases a *new* plaintext token is
+    /// minted and returned exactly once (matching `create_token` semantics).
+    ///
+    /// Idempotent on `users.name`: a webhook retry against an existing ref mints
+    /// an additional token rather than failing. keygate's `find_by_stripe_id`
+    /// short-circuit prevents that from happening for the same buyer in practice.
+    pub fn provision_user_token(&self, name: &str) -> Result<(String, bool), RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
+            .optional()?;
+        let (id, created) = match existing {
+            Some(id) => (id, false),
+            None => {
+                conn.execute(
+                    "INSERT INTO users (name, created_at) VALUES (?1, ?2)",
+                    rusqlite::params![name, Self::now()],
+                )?;
+                (conn.last_insert_rowid(), true)
+            }
+        };
+        let token = generate_token();
+        conn.execute(
+            "INSERT INTO tokens (user_id, token_hash, label, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, hash_token(&token), Some("self-serve"), Self::now()],
+        )?;
+        Ok((token, created))
+    }
+
+    /// Release a user's claimed hostnames (and optionally their reserved TCP
+    /// ports) back to the global pool, returning what was released. The user and
+    /// their tokens are intentionally *kept*, so a resubscriber retains the same
+    /// account/token; only the claimable namespace is reclaimed.
+    ///
+    /// Returns `NoSuchUser` if `name` is unknown so the caller (the keygate
+    /// reaper) can treat that as already-released.
+    pub fn release_user_hostnames(
+        &self,
+        name: &str,
+        release_ports: bool,
+    ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        let id = Self::user_id(&conn, name)?;
+        let hostnames: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT label FROM hostnames WHERE user_id = ?1")?;
+            let rows = stmt
+                .query_map([id], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        conn.execute("DELETE FROM hostnames WHERE user_id = ?1", [id])?;
+        let ports = if release_ports {
+            let ports: Vec<u16> = {
+                let mut stmt = conn.prepare("SELECT port FROM tcp_ports WHERE user_id = ?1")?;
+                let rows = stmt
+                    .query_map([id], |r| Ok(r.get::<_, i64>(0)? as u16))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            conn.execute("DELETE FROM tcp_ports WHERE user_id = ?1", [id])?;
+            ports
+        } else {
+            Vec::new()
+        };
+        Ok((hostnames, ports))
+    }
+
+    /// Register `label` to `user_id` if it is free (first-come-first-served from
+    /// the global label pool). Returns:
+    ///
+    /// * `Ok(true)`  — the label was free and is now registered to this user.
+    /// * `Ok(false)` — the label is already owned by *this* user (idempotent).
+    /// * `Err(LabelTaken)` — the label is owned by someone else.
+    /// * `Err(InvalidLabel)` — the label fails `validate_label` (reserved/malformed).
+    ///
+    /// Atomicity rests on the `UNIQUE(label)` index on `hostnames`: two daemons
+    /// racing the same free label both attempt the INSERT; one wins, the other
+    /// gets the UNIQUE violation surfaced as `LabelTaken`.
+    pub fn claim_label(&self, user_id: i64, label: &str) -> Result<bool, RegistryError> {
+        validate_label(label).map_err(|e| RegistryError::InvalidLabel(label.to_owned(), e))?;
+        let conn = self.conn.lock().unwrap();
+        // Fast path: already owned by this user → idempotent no-op.
+        let owner: Option<i64> = conn
+            .query_row(
+                "SELECT user_id FROM hostnames WHERE label = ?1",
+                [label],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(owner_id) = owner {
+            return if owner_id == user_id {
+                Ok(false)
+            } else {
+                Err(RegistryError::LabelTaken(label.to_owned()))
+            };
+        }
+        // Free: attempt the insert. A concurrent writer may have claimed it
+        // between the SELECT and here; the UNIQUE index makes the INSERT the
+        // real arbiter and surfaces the race as LabelTaken.
+        match conn.execute(
+            "INSERT INTO hostnames (user_id, label, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![user_id, label, Self::now()],
+        ) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(RegistryError::LabelTaken(label.to_owned()))
+            }
+            Err(e) => Err(RegistryError::Db(e)),
+        }
+    }
+
     /// Create a token for a user, returning the plaintext (shown once).
     pub fn create_token(&self, user: &str, label: Option<&str>) -> Result<String, RegistryError> {
         let conn = self.conn.lock().unwrap();
@@ -414,6 +531,24 @@ impl Authenticator for Registry {
         .map(|o| o.is_some())
         .unwrap_or(false)
     }
+
+    fn claim_hostname(&self, user_id: i64, hostname: &str) -> ClaimOutcome {
+        // Fail closed on anything that isn't a valid, non-reserved label under
+        // this relay's apex (wrong apex, too deep, reserved, malformed) — the
+        // same gate `owns_hostname` applies via `label_of`.
+        let Some(label) = self.label_of(hostname) else {
+            return ClaimOutcome::Invalid("not a valid hostname under this relay");
+        };
+        match self.claim_label(user_id, &label) {
+            Ok(_) => ClaimOutcome::Owned,
+            Err(RegistryError::LabelTaken(_)) => ClaimOutcome::Taken,
+            Err(RegistryError::InvalidLabel(_, why)) => ClaimOutcome::Invalid(why),
+            Err(e) => {
+                tracing::error!(hostname, error = %e, "claim_hostname storage error");
+                ClaimOutcome::Error
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,6 +617,87 @@ mod tests {
         assert!(matches!(
             r.add_port(20000, "mat"),
             Err(RegistryError::PortTaken(20000))
+        ));
+    }
+
+    #[test]
+    fn provision_user_token_is_idempotent_on_name() {
+        let r = reg();
+        // First provision creates the user.
+        let (t1, created1) = r.provision_user_token("acct_abc").unwrap();
+        assert!(created1, "first provision creates the user");
+        assert!(t1.starts_with("etun_"));
+        assert!(r.authenticate(&t1).is_some());
+
+        // Second provision against the same ref reuses the user and mints a new
+        // token (both tokens authenticate to the same user).
+        let (t2, created2) = r.provision_user_token("acct_abc").unwrap();
+        assert!(!created2, "second provision reuses the existing user");
+        assert_ne!(t1, t2);
+        assert_eq!(
+            r.authenticate(&t1).unwrap().user_id,
+            r.authenticate(&t2).unwrap().user_id
+        );
+        // Exactly one user row exists.
+        assert_eq!(r.list_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn release_user_hostnames_returns_and_empties() {
+        let r = reg();
+        let uid = r.add_user("acct_x").unwrap();
+        r.add_hostname("alpha", "acct_x").unwrap();
+        r.add_hostname("beta", "acct_x").unwrap();
+        r.add_port(20001, "acct_x").unwrap();
+
+        // Without releasing ports.
+        let (mut hosts, ports) = r.release_user_hostnames("acct_x", false).unwrap();
+        hosts.sort();
+        assert_eq!(hosts, vec!["alpha".to_string(), "beta".to_string()]);
+        assert!(ports.is_empty());
+        assert!(r.list_hostnames(Some("acct_x")).unwrap().is_empty());
+        // The user and the port survive.
+        assert!(r.owns_port(uid, 20001));
+
+        // Releasing again is a no-op (empty), and a label freed is reclaimable.
+        let (hosts2, _) = r.release_user_hostnames("acct_x", true).unwrap();
+        assert!(hosts2.is_empty());
+        assert!(!r.owns_port(uid, 20001));
+
+        // Unknown user → NoSuchUser (reaper treats as already released).
+        assert!(matches!(
+            r.release_user_hostnames("nobody", true),
+            Err(RegistryError::NoSuchUser(_))
+        ));
+    }
+
+    #[test]
+    fn claim_label_free_own_taken() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+        let eve = r.add_user("acct_eve").unwrap();
+
+        // Free → registered.
+        assert_eq!(r.claim_label(mat, "myapp").unwrap(), true);
+        assert!(r.owns_hostname(mat, "myapp.ethertunnel.com"));
+
+        // Already mine → idempotent false, no error.
+        assert_eq!(r.claim_label(mat, "myapp").unwrap(), false);
+
+        // Owned by someone else → LabelTaken.
+        assert!(matches!(
+            r.claim_label(eve, "myapp"),
+            Err(RegistryError::LabelTaken(_))
+        ));
+
+        // Reserved/invalid → InvalidLabel, nothing registered.
+        assert!(matches!(
+            r.claim_label(mat, "connect"),
+            Err(RegistryError::InvalidLabel(_, _))
+        ));
+        assert!(matches!(
+            r.claim_label(mat, "Bad_Label"),
+            Err(RegistryError::InvalidLabel(_, _))
         ));
     }
 

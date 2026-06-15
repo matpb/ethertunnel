@@ -283,6 +283,14 @@ async fn route(
     let host = host_of(&req);
 
     if host.as_deref() == Some(&config.connect_host()) {
+        // The provisioning control plane shares this host with the WS control
+        // upgrade; method+path discriminate them (admin = POST /admin/*, the
+        // upgrade = GET + Upgrade headers). Only matches when `[provision]` is
+        // configured (`is_admin_request` checks installation), so the relay has
+        // no inbound control API otherwise.
+        if crate::admin_http::is_admin_request(&ctx, &req) {
+            return Ok(crate::admin_http::handle(ctx, req).await);
+        }
         return Ok(handle_control_upgrade(&mut req, ctx, cancel));
     }
 

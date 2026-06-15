@@ -25,6 +25,36 @@ pub struct Config {
     /// Connection-admission and anti-DoS limits for the public listener.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// Self-serve provisioning control plane (the keygate-authed `/admin/*`
+    /// endpoints on `connect.<domain>`). Absent => those endpoints are not
+    /// mounted and the relay has no inbound control API, exactly as before.
+    #[serde(default)]
+    pub provision: Option<ProvisionConfig>,
+}
+
+/// Authentication material for the keygate→relay provisioning control plane.
+/// keygate presents the shared bearer token on `/admin/provision` and
+/// `/admin/release`; the relay constant-time-compares it against the contents
+/// of `token_file`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProvisionConfig {
+    /// File holding the shared bearer token keygate presents on `/admin/*`
+    /// calls. Kept out of the config (mirrors `KeygateConfig::consumer_token_file`)
+    /// so the secret never lands in a world-readable file.
+    pub token_file: PathBuf,
+}
+
+impl ProvisionConfig {
+    /// Read and trim the shared provisioning bearer token from `token_file`.
+    pub fn token(&self) -> anyhow::Result<String> {
+        let raw = std::fs::read_to_string(&self.token_file)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.token_file.display()))?;
+        let token = raw.trim().to_owned();
+        if token.is_empty() {
+            anyhow::bail!("provision token file {} is empty", self.token_file.display());
+        }
+        Ok(token)
+    }
 }
 
 /// Anti-DoS admission limits for the `:443` listener. All have safe defaults so

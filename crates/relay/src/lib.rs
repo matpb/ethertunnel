@@ -9,6 +9,7 @@
 //! that turns an inbound connection into a session. The HTTP proxy lands in M3.
 
 pub mod acme;
+pub mod admin_http;
 pub mod auth;
 pub mod config;
 pub mod dns_cloudflare;

@@ -76,6 +76,10 @@ pub struct SessionCtx {
     /// configured. `None` means no enforcement (self-host / pre-billing): every
     /// owned claim is allowed, exactly as before this integration.
     pub entitlements: arc_swap::ArcSwapOption<crate::entitlement::EntitlementGate>,
+    /// keygate-authed provisioning control plane, installed by `run_serve` when
+    /// `[provision]` is configured. `None` means the `/admin/*` provisioning
+    /// endpoints are not mounted (the relay has no inbound control API).
+    pub provision: arc_swap::ArcSwapOption<crate::admin_http::ProvisionState>,
     next_session_id: AtomicU64,
 }
 
@@ -91,8 +95,15 @@ impl SessionCtx {
             server_version,
             tcp: arc_swap::ArcSwapOption::empty(),
             entitlements: arc_swap::ArcSwapOption::empty(),
+            provision: arc_swap::ArcSwapOption::empty(),
             next_session_id: AtomicU64::new(1),
         })
+    }
+
+    /// Install the keygate provisioning control plane (called by `run_serve`
+    /// when `[provision]` is configured).
+    pub fn set_provision(&self, state: Arc<crate::admin_http::ProvisionState>) {
+        self.provision.store(Some(state));
     }
 
     /// Install the raw-TCP port manager (called by `serve`).
@@ -401,18 +412,6 @@ async fn handle_claim(
 
     let hostnames: Vec<String> = hostnames.iter().map(|h| h.to_ascii_lowercase()).collect();
 
-    // All-or-nothing ownership check before mutating any route.
-    for host in &hostnames {
-        if !ctx.auth.owns_hostname(user.user_id, host) {
-            let _ = ctrl_tx
-                .send(ControlFrame::Denied {
-                    code: DenyCode::NotOwner,
-                    message: format!("not authorized for {host}"),
-                })
-                .await;
-            return;
-        }
-    }
     let tcp = ctx.tcp.load_full();
     for port in &tcp_ports {
         let Some(manager) = &tcp else {
@@ -445,9 +444,13 @@ async fn handle_claim(
         }
     }
 
-    // keygate entitlement enforcement. Fail-open: when no gate is installed, or
-    // the customer has no fresh cached entitlement, the claim proceeds. Only an
-    // active cap that this claim would exceed (or a suspended account) is denied.
+    // keygate entitlement enforcement runs BEFORE any hostname is registered, so
+    // we never persist a label the cap would reject (no leaked rows). Fail-open:
+    // when no gate is installed, or the customer has no fresh cached entitlement,
+    // the claim proceeds. Only an active cap that this claim would exceed (or a
+    // suspended account) is denied. The projected count includes the requested
+    // hostnames/ports regardless of whether they're already registered, matching
+    // the existing "concurrently active tunnels" semantics.
     if let Some(gate) = ctx.entitlements.load_full() {
         use crate::entitlement::{now_unix, CapDecision};
         match gate.cap_for(&user.name, now_unix()) {
@@ -476,6 +479,53 @@ async fn handle_claim(
                         .await;
                     return;
                 }
+            }
+        }
+    }
+
+    // Register-or-own each hostname from the global label pool. This runs only
+    // after the cap check passed, so a rejected claim never leaves a registered
+    // label behind. Self-registration is first-come-first-served: a free label
+    // is claimed for this user; one the user already owns is a no-op; one owned
+    // by someone else is refused. When no real registry backs the authenticator
+    // (self-host without provisioning) the default trait impl keeps the legacy
+    // "must already own it" behavior.
+    //
+    // All-or-nothing semantics are preserved relative to *routing*: we register
+    // every label before touching the router, and on the first refusal we stop
+    // and deny without claiming any route. (Labels registered earlier in this
+    // same claim for free remain owned by the user — they are theirs now, just
+    // not routed this round; a retry re-grants them idempotently.)
+    use crate::auth::ClaimOutcome;
+    for host in &hostnames {
+        match ctx.auth.claim_hostname(user.user_id, host) {
+            ClaimOutcome::Owned => {}
+            ClaimOutcome::Taken => {
+                let _ = ctrl_tx
+                    .send(ControlFrame::Denied {
+                        code: DenyCode::NotOwner,
+                        message: format!("not authorized for {host}"),
+                    })
+                    .await;
+                return;
+            }
+            ClaimOutcome::Invalid(why) => {
+                let _ = ctrl_tx
+                    .send(ControlFrame::Denied {
+                        code: DenyCode::NotOwner,
+                        message: format!("cannot claim {host}: {why}"),
+                    })
+                    .await;
+                return;
+            }
+            ClaimOutcome::Error => {
+                let _ = ctrl_tx
+                    .send(ControlFrame::Denied {
+                        code: DenyCode::NotOwner,
+                        message: format!("could not register {host}"),
+                    })
+                    .await;
+                return;
             }
         }
     }
@@ -662,14 +712,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_unowned_hostname_is_denied() {
-        let (ctx, router, _auth, _uid) = fixture();
+    async fn claim_label_owned_by_another_user_is_denied() {
+        // A label already registered to a *different* user must be refused —
+        // self-registration is first-come-first-served, not a takeover.
+        let (ctx, router, auth, _uid) = fixture();
+        let eve = auth.add_user("eve", "etun_eve");
+        auth.grant_hostname(eve, "taken.ethertunnel.com");
+
         let mut ctrl = connect(ctx).await;
         handshake(&mut ctrl, "etun_good").await;
         send(
             &mut ctrl,
             ControlFrame::Claim {
-                hostnames: vec!["someone-else.ethertunnel.com".into()],
+                hostnames: vec!["taken.ethertunnel.com".into()],
                 tcp_ports: vec![],
             },
         )
@@ -678,7 +733,87 @@ mod tests {
             ControlFrame::Denied { code, .. } => assert_eq!(code, DenyCode::NotOwner),
             other => panic!("expected Denied, got {other:?}"),
         }
-        assert!(router.lookup_http("someone-else.ethertunnel.com").is_none());
+        // The route is not stolen from eve.
+        assert!(router.lookup_http("taken.ethertunnel.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_free_label_auto_registers_and_is_granted() {
+        // A label nobody owns is self-registered to the claimant and routed.
+        let (ctx, router, auth, uid) = fixture();
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["brandnew.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Granted { hostnames, .. } => {
+                assert_eq!(hostnames, vec!["brandnew.ethertunnel.com".to_string()]);
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        assert!(router.lookup_http("brandnew.ethertunnel.com").is_some());
+        // And it is now owned by the claimant.
+        assert!(auth.owns_hostname(uid, "brandnew.ethertunnel.com"));
+    }
+
+    #[tokio::test]
+    async fn claim_exceeding_cap_is_denied_and_label_not_registered() {
+        use crate::entitlement::{
+            Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy,
+        };
+        let (ctx, router, auth, _uid) = fixture();
+
+        // Install a gate capping "mat" at 1 concurrent tunnel.
+        let cache = EntitlementCache::open_in_memory().unwrap();
+        cache
+            .upsert(&Entitlement {
+                external_ref: "mat".into(),
+                customer_id: 1,
+                max_tunnels: Some(1),
+                status: "active".into(),
+                issued_at: 0,
+                expires_at: i64::MAX,
+                updated_at: 0,
+            })
+            .unwrap();
+        let gate = EntitlementGate::new(
+            cache,
+            KeygatePolicy {
+                product: "ethertunnel".into(),
+                public_key_b64: String::new(),
+                key_id: "k1".into(),
+                staleness_ceiling_secs: 0,
+                require_entitlement: false,
+            },
+        );
+        ctx.set_entitlements(Arc::new(gate));
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        // Two free labels in one claim → projected 2 > cap 1 → denied.
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["one.ethertunnel.com".into(), "two.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Denied { code, .. } => assert_eq!(code, DenyCode::LimitExceeded),
+            other => panic!("expected Denied(LimitExceeded), got {other:?}"),
+        }
+        // Crucially, neither label leaked into the registry: the cap check runs
+        // before self-registration.
+        assert!(!auth.owns_hostname(_uid, "one.ethertunnel.com"));
+        assert!(!auth.owns_hostname(_uid, "two.ethertunnel.com"));
+        assert!(router.lookup_http("one.ethertunnel.com").is_none());
     }
 
     #[tokio::test]

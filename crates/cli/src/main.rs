@@ -338,11 +338,26 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Keep an Arc<Registry> clone so the provisioning control plane can reach the
+    // concrete registry (the Authenticator trait object can't mint tokens).
+    let registry = Arc::new(registry);
     let ctx = SessionCtx::new(
         Arc::new(Router::new()),
-        Arc::new(registry),
+        registry.clone(),
         env!("CARGO_PKG_VERSION").to_owned(),
     );
+
+    // Wire the keygate→relay provisioning control plane when configured. Absent
+    // => the `/admin/*` endpoints are not mounted (no inbound control API).
+    if let Some(pv) = &config.provision {
+        use ethertunnel_relay::admin_http::ProvisionState;
+        let token = pv.token().context("reading provision token")?;
+        ctx.set_provision(Arc::new(ProvisionState {
+            registry: registry.clone(),
+            token,
+        }));
+        tracing::info!("self-serve provisioning control plane enabled on connect host");
+    }
 
     // Wire keygate entitlement enforcement when configured. Absent => no gate,
     // so the relay behaves exactly as before (every owned claim allowed).
