@@ -451,6 +451,13 @@ async fn handle_claim(
     // suspended account) is denied. The projected count includes the requested
     // hostnames/ports regardless of whether they're already registered, matching
     // the existing "concurrently active tunnels" semantics.
+    // The authoritative cap, when one applies, is enforced against OWNED
+    // registry rows inside `claim_hostname` (atomic with the insert). This
+    // `cap` carries the active limit through to that call. The projected
+    // routed-count check below is only a cheap pre-check that rejects obvious
+    // over-claims early; it is NOT authoritative, because routed counts drop to
+    // zero on disconnect while owned rows persist (the squatting hole).
+    let mut cap: Option<i64> = None;
     if let Some(gate) = ctx.entitlements.load_full() {
         use crate::entitlement::{now_unix, CapDecision};
         match gate.cap_for(&user.name, now_unix()) {
@@ -465,6 +472,7 @@ async fn handle_claim(
                 return;
             }
             CapDecision::Cap(max) => {
+                cap = Some(max);
                 let projected =
                     ctx.router
                         .projected_tunnel_count(user.user_id, &hostnames, &tcp_ports);
@@ -498,13 +506,29 @@ async fn handle_claim(
     // not routed this round; a retry re-grants them idempotently.)
     use crate::auth::ClaimOutcome;
     for host in &hostnames {
-        match ctx.auth.claim_hostname(user.user_id, host) {
+        match ctx.auth.claim_hostname(user.user_id, host, cap) {
             ClaimOutcome::Owned => {}
             ClaimOutcome::Taken => {
                 let _ = ctrl_tx
                     .send(ControlFrame::Denied {
                         code: DenyCode::NotOwner,
                         message: format!("not authorized for {host}"),
+                    })
+                    .await;
+                return;
+            }
+            ClaimOutcome::CapExceeded => {
+                // Authoritative owned-row cap hit: this free label would push the
+                // account past its plan limit. Deny in the existing LimitExceeded
+                // style; no label was registered (the cap check is inside the
+                // insert path).
+                let max = cap.unwrap_or_default();
+                let _ = ctrl_tx
+                    .send(ControlFrame::Denied {
+                        code: DenyCode::LimitExceeded,
+                        message: format!(
+                            "tunnel limit reached ({max}); upgrade your plan for more"
+                        ),
                     })
                     .await;
                 return;
@@ -814,6 +838,64 @@ mod tests {
         assert!(!auth.owns_hostname(_uid, "one.ethertunnel.com"));
         assert!(!auth.owns_hostname(_uid, "two.ethertunnel.com"));
         assert!(router.lookup_http("one.ethertunnel.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn owned_cap_blocks_reclaim_after_disconnect() {
+        // The squatting hole: with a cap of 1, claim a label, disconnect (routed
+        // count drops to 0 but the owned row persists), then a NEW session tries
+        // a DIFFERENT free label. The authoritative owned-row cap inside
+        // claim_hostname must deny it even though the routed/projected count is 0.
+        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        let (ctx, _router, auth, uid) = fixture();
+
+        let cache = EntitlementCache::open_in_memory().unwrap();
+        cache
+            .upsert(&Entitlement {
+                external_ref: "mat".into(),
+                customer_id: 1,
+                max_tunnels: Some(1),
+                status: "active".into(),
+                issued_at: 0,
+                expires_at: i64::MAX,
+                updated_at: 0,
+            })
+            .unwrap();
+        let gate = EntitlementGate::new(
+            cache,
+            KeygatePolicy {
+                product: "ethertunnel".into(),
+                public_key_b64: String::new(),
+                key_id: "k1".into(),
+                staleness_ceiling_secs: 0,
+                require_entitlement: false,
+            },
+        );
+        ctx.set_entitlements(Arc::new(gate));
+
+        // Simulate the user already owning one label from a prior, now-closed
+        // session (MemoryAuth owned rows persist independently of routing).
+        auth.grant_hostname(uid, "first.ethertunnel.com");
+
+        // A fresh session claims a DIFFERENT free label. Routed count is 0, so the
+        // projected pre-check passes — but the owned-row count is already 1 == cap,
+        // so the authoritative check inside claim_hostname denies it.
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["second.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Denied { code, .. } => assert_eq!(code, DenyCode::LimitExceeded),
+            other => panic!("expected Denied(LimitExceeded), got {other:?}"),
+        }
+        // The second label never leaked into the owned set.
+        assert!(!auth.owns_hostname(uid, "second.ethertunnel.com"));
     }
 
     #[tokio::test]

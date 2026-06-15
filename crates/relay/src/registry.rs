@@ -36,6 +36,8 @@ pub enum RegistryError {
     LabelTaken(String),
     #[error("port {0} is reserved by another user")]
     PortTaken(u16),
+    #[error("tunnel cap reached: already owns the maximum number of resources")]
+    CapExceeded,
 }
 
 /// Reserved labels that may never be claimed as tunnel hostnames.
@@ -293,6 +295,22 @@ impl Registry {
         Ok((hostnames, ports))
     }
 
+    /// Count the resources `user_id` *owns* in the registry: claimed hostname
+    /// labels plus reserved TCP ports. Tokens are deliberately excluded — they
+    /// are credentials, not squattable namespace. This is the authoritative
+    /// per-account tunnel cap measure (owned rows persist across disconnects,
+    /// unlike the router's in-memory routed count).
+    pub fn count_owned_resources(&self, user_id: i64) -> Result<i64, RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM hostnames WHERE user_id=?1)
+                  + (SELECT COUNT(*) FROM tcp_ports WHERE user_id=?1)",
+            [user_id],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Register `label` to `user_id` if it is free (first-come-first-served from
     /// the global label pool). Returns:
     ///
@@ -305,9 +323,32 @@ impl Registry {
     /// racing the same free label both attempt the INSERT; one wins, the other
     /// gets the UNIQUE violation surfaced as `LabelTaken`.
     pub fn claim_label(&self, user_id: i64, label: &str) -> Result<bool, RegistryError> {
+        self.claim_label_capped(user_id, label, None)
+    }
+
+    /// Like [`claim_label`](Self::claim_label) but enforces a per-account cap on
+    /// the number of *owned* resources, atomically with the insert.
+    ///
+    /// The cap check and the insert run under the same connection mutex, so the
+    /// count-then-insert cannot race another claim from the same user: the
+    /// connection mutex already serializes every registry call. Semantics:
+    ///
+    /// * already owned by this user → `Ok(false)` (idempotent no-op, allowed
+    ///   regardless of `max` — re-claiming what you already own never counts).
+    /// * owned by another user → `Err(LabelTaken)`.
+    /// * free, `max == Some(m)`, and current owned count `>= m` → `Err(CapExceeded)`.
+    /// * free and under cap (or `max == None`) → INSERT, with the UNIQUE-index
+    ///   race still mapped to `LabelTaken`.
+    pub fn claim_label_capped(
+        &self,
+        user_id: i64,
+        label: &str,
+        max: Option<i64>,
+    ) -> Result<bool, RegistryError> {
         validate_label(label).map_err(|e| RegistryError::InvalidLabel(label.to_owned(), e))?;
         let conn = self.conn.lock().unwrap();
-        // Fast path: already owned by this user → idempotent no-op.
+        // Fast path: already owned by this user → idempotent no-op. Re-claiming a
+        // label you already hold never counts against the cap.
         let owner: Option<i64> = conn
             .query_row(
                 "SELECT user_id FROM hostnames WHERE label = ?1",
@@ -322,9 +363,22 @@ impl Registry {
                 Err(RegistryError::LabelTaken(label.to_owned()))
             };
         }
-        // Free: attempt the insert. A concurrent writer may have claimed it
-        // between the SELECT and here; the UNIQUE index makes the INSERT the
-        // real arbiter and surfaces the race as LabelTaken.
+        // Free label: enforce the cap against the owned-row count BEFORE the
+        // insert, under this same lock so the check-then-act is atomic.
+        if let Some(m) = max {
+            let owned: i64 = conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM hostnames WHERE user_id=?1)
+                      + (SELECT COUNT(*) FROM tcp_ports WHERE user_id=?1)",
+                [user_id],
+                |r| r.get(0),
+            )?;
+            if owned >= m {
+                return Err(RegistryError::CapExceeded);
+            }
+        }
+        // Attempt the insert. A concurrent writer may have claimed it between the
+        // SELECT and here; the UNIQUE index makes the INSERT the real arbiter and
+        // surfaces the race as LabelTaken.
         match conn.execute(
             "INSERT INTO hostnames (user_id, label, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![user_id, label, Self::now()],
@@ -532,16 +586,17 @@ impl Authenticator for Registry {
         .unwrap_or(false)
     }
 
-    fn claim_hostname(&self, user_id: i64, hostname: &str) -> ClaimOutcome {
+    fn claim_hostname(&self, user_id: i64, hostname: &str, max: Option<i64>) -> ClaimOutcome {
         // Fail closed on anything that isn't a valid, non-reserved label under
         // this relay's apex (wrong apex, too deep, reserved, malformed) — the
         // same gate `owns_hostname` applies via `label_of`.
         let Some(label) = self.label_of(hostname) else {
             return ClaimOutcome::Invalid("not a valid hostname under this relay");
         };
-        match self.claim_label(user_id, &label) {
+        match self.claim_label_capped(user_id, &label, max) {
             Ok(_) => ClaimOutcome::Owned,
             Err(RegistryError::LabelTaken(_)) => ClaimOutcome::Taken,
+            Err(RegistryError::CapExceeded) => ClaimOutcome::CapExceeded,
             Err(RegistryError::InvalidLabel(_, why)) => ClaimOutcome::Invalid(why),
             Err(e) => {
                 tracing::error!(hostname, error = %e, "claim_hostname storage error");
@@ -678,11 +733,11 @@ mod tests {
         let eve = r.add_user("acct_eve").unwrap();
 
         // Free → registered.
-        assert_eq!(r.claim_label(mat, "myapp").unwrap(), true);
+        assert!(r.claim_label(mat, "myapp").unwrap());
         assert!(r.owns_hostname(mat, "myapp.ethertunnel.com"));
 
         // Already mine → idempotent false, no error.
-        assert_eq!(r.claim_label(mat, "myapp").unwrap(), false);
+        assert!(!r.claim_label(mat, "myapp").unwrap());
 
         // Owned by someone else → LabelTaken.
         assert!(matches!(
@@ -699,6 +754,62 @@ mod tests {
             r.claim_label(mat, "Bad_Label"),
             Err(RegistryError::InvalidLabel(_, _))
         ));
+    }
+
+    #[test]
+    fn claim_label_capped_enforces_owned_count() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+
+        // Cap of 2. Two fresh labels are fine and bring owned count to 2.
+        assert!(r.claim_label_capped(mat, "one", Some(2)).unwrap());
+        assert!(r.claim_label_capped(mat, "two", Some(2)).unwrap());
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
+
+        // (a) At the cap, a NEW free label is refused with CapExceeded and is
+        // NOT registered (no leaked row).
+        assert!(matches!(
+            r.claim_label_capped(mat, "three", Some(2)),
+            Err(RegistryError::CapExceeded)
+        ));
+        assert!(!r.owns_hostname(mat, "three.ethertunnel.com"));
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
+
+        // (b) The same user can still re-claim a label they already own, even at
+        // the cap — idempotent no-op, no error.
+        assert!(!r.claim_label_capped(mat, "one", Some(2)).unwrap());
+
+        // (c) After releasing a hostname the user is back under cap and can claim
+        // a new one again.
+        assert!(r.remove_hostname("two").unwrap());
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 1);
+        assert!(r.claim_label_capped(mat, "three", Some(2)).unwrap());
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
+    }
+
+    #[test]
+    fn claim_label_capped_max_none_is_uncapped() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+        // (d) max=None never refuses on cap grounds, regardless of owned count.
+        for label in ["a", "b", "c", "d", "e"] {
+            assert!(r.claim_label_capped(mat, label, None).unwrap());
+        }
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 5);
+    }
+
+    #[test]
+    fn count_owned_resources_counts_hostnames_and_ports_not_tokens() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 0);
+        // Tokens do not count toward the owned-resource cap.
+        let _ = r.create_token("acct_mat", Some("laptop")).unwrap();
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 0);
+        // Hostnames and ports both count.
+        r.add_hostname("alpha", "acct_mat").unwrap();
+        r.add_port(20002, "acct_mat").unwrap();
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
     }
 
     #[test]

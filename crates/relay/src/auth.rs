@@ -27,6 +27,9 @@ pub enum ClaimOutcome {
     /// The hostname is not a valid claimable label under this relay (wrong apex,
     /// too deep, reserved, or malformed). The string is a human-readable reason.
     Invalid(&'static str),
+    /// Claiming this *free* label would push the user past their per-account cap
+    /// on owned resources. Re-claiming an already-owned label never returns this.
+    CapExceeded,
     /// A storage error occurred; the claim could not be completed.
     Error,
 }
@@ -47,11 +50,20 @@ pub trait Authenticator: Send + Sync + 'static {
     /// Self-register `hostname` to `user_id` from the global label pool
     /// (first-come-first-served), or confirm the user already owns it.
     ///
+    /// `max` is the per-account cap on *owned* resources: when `Some(m)`,
+    /// claiming a *free* label is refused with `CapExceeded` if the user already
+    /// owns `m` or more resources. Re-claiming a label the user already holds is
+    /// always allowed (idempotent, never counts against the cap). `None` is
+    /// uncapped. The cap must be enforced atomically with the registration so a
+    /// rejected claim never leaves a registered label behind.
+    ///
     /// The default implementation preserves the legacy "labels are
     /// admin-pre-registered" behavior: it never creates a label, only reporting
-    /// `Owned` for one the user already holds, `Taken` otherwise. The SQLite
-    /// registry overrides this to actually claim a free label.
-    fn claim_hostname(&self, user_id: i64, hostname: &str) -> ClaimOutcome {
+    /// `Owned` for one the user already holds, `Taken` otherwise (and so never
+    /// returns `CapExceeded` — it cannot grow the owned set). The SQLite registry
+    /// overrides this to actually claim a free label under the cap.
+    fn claim_hostname(&self, user_id: i64, hostname: &str, max: Option<i64>) -> ClaimOutcome {
+        let _ = max;
         if self.owns_hostname(user_id, hostname) {
             ClaimOutcome::Owned
         } else {
@@ -143,7 +155,7 @@ impl Authenticator for MemoryAuth {
             .is_some_and(|s| s.contains(&port))
     }
 
-    fn claim_hostname(&self, user_id: i64, hostname: &str) -> ClaimOutcome {
+    fn claim_hostname(&self, user_id: i64, hostname: &str, max: Option<i64>) -> ClaimOutcome {
         let mut g = self.inner.lock().unwrap();
         // Owned by someone? Decide based on who.
         let owner = g
@@ -155,6 +167,15 @@ impl Authenticator for MemoryAuth {
             Some(uid) if uid == user_id => ClaimOutcome::Owned,
             Some(_) => ClaimOutcome::Taken,
             None => {
+                // Free label: enforce the cap against owned (hostnames + ports)
+                // rows before registering, atomically under the same lock.
+                if let Some(m) = max {
+                    let owned = g.hostnames.get(&user_id).map_or(0, |s| s.len())
+                        + g.ports.get(&user_id).map_or(0, |s| s.len());
+                    if owned as i64 >= m {
+                        return ClaimOutcome::CapExceeded;
+                    }
+                }
                 g.hostnames
                     .entry(user_id)
                     .or_default()
