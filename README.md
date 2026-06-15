@@ -162,6 +162,16 @@ Found something? Please report it **privately** — see
 [SECURITY.md](SECURITY.md) for the disclosure process. Do not open a public
 issue for security reports.
 
+Abuse of the hosted relay at `ethertunnel.com` (phishing, malware,
+command-and-control, etc.): email **abuse@ethertunnel.com**.
+
+## Support
+
+Questions, bug reports, and feature requests: open a
+[GitHub issue](https://github.com/matpb/ethertunnel/issues). Please keep the
+issue tracker for those — security vulnerabilities and abuse reports go to the
+private addresses above.
+
 ## License
 
 EtherTunnel is licensed under the **GNU Affero General Public License v3.0 or

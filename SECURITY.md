@@ -58,7 +58,8 @@ memory-safety issues in any `unsafe` code.
 
 - The hosted relay at `ethertunnel.com` as an operational service (rate limits,
   uptime, abuse handling) — report code issues here; report service issues to the
-  operator.
+  operator, and abuse of the hosted service to **abuse@ethertunnel.com** (see
+  below).
 - Vulnerabilities in third-party dependencies that aren't reachable through
   EtherTunnel's use of them (please still tell us if a `cargo audit` advisory
   *is* reachable).
@@ -83,5 +84,16 @@ security boundary and are documented in
 - Treat bearer tokens as secrets: they're stored only as SHA-256 hashes on the
   relay, but the plaintext is shown once at creation and lives in the client's
   `0600` credentials file.
+
+## Reporting abuse
+
+This is distinct from a security vulnerability. If a tunnel on the **hosted**
+relay at `ethertunnel.com` is being used for phishing, malware distribution,
+command-and-control, or other abuse, email **abuse@ethertunnel.com** with the
+tunnel hostname (or URL) and what you observed. We act on hosted-service abuse
+reports directly.
+
+If you self-host your own relay, you are its operator — report abuse of it to
+whoever runs that deployment.
 
 Thank you for helping keep EtherTunnel and the people who run it safe.
