@@ -117,6 +117,13 @@ impl MemoryAuth {
             .insert(hostname.to_owned());
     }
 
+    /// Revoke a bearer token so `authenticate` no longer resolves it. Used to
+    /// exercise live token re-validation in tests (the SQLite registry has its
+    /// own `revoke_token`). Returns true if the token existed.
+    pub fn revoke(&self, token: &str) -> bool {
+        self.inner.lock().unwrap().tokens.remove(token).is_some()
+    }
+
     /// Grant ownership of a public TCP port to a user.
     pub fn grant_port(&self, user_id: i64, port: u16) {
         self.inner

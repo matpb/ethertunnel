@@ -17,18 +17,37 @@ RestartSec=5
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# Hardening.
+# Hardening (parity with the client --system unit; keeps CAP_NET_BIND_SERVICE
+# above because the relay binds :443).
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
+ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
 LockPersonality=true
+# W^X: safe for a plain Rust binary (no JIT) and pairs with panic=abort.
+MemoryDenyWriteExecute=true
+# AF_UNIX is REQUIRED for NSS/getaddrinfo; AF_INET/AF_INET6 for the sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+PrivateDevices=true
+# Owner-only files/dirs (completes the DB-perms fix: registry/keygate DBs + certs).
+UMask=0077
 # State the relay may write to (registry DB + issued certs).
 StateDirectory=ethertunnel
+StateDirectoryMode=0700
 ReadWritePaths=/var/lib/ethertunnel
 LimitNOFILE=65536
 

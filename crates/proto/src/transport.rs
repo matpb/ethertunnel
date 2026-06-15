@@ -17,6 +17,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::WebSocketStream;
 use bytes::Bytes;
@@ -57,6 +58,24 @@ impl<S> WsByteStream<S> {
     }
 }
 
+/// Bound inbound WebSocket reassembly to [`limits::MAX_WS_MESSAGE`] (1 MiB) on
+/// BOTH the relay (server) and client legs. Without this, tungstenite applies
+/// its 64 MiB/16 MiB defaults, letting an unauthenticated peer drive a single
+/// connection to buffer ~64 MiB pre-auth. yamux frames are already chunked under
+/// `MAX_WS_MESSAGE` on the write side, so no legitimate message approaches this.
+///
+/// NOTE: these are public *struct fields* on tungstenite 0.24 (the builder
+/// methods don't exist there); struct-update from `Default` also avoids naming
+/// the deprecated `max_send_queue` field and preserves the write-buffer invariant
+/// `max_write_buffer_size > write_buffer_size`.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(limits::MAX_WS_MESSAGE),
+        max_frame_size: Some(limits::MAX_WS_MESSAGE),
+        ..Default::default()
+    }
+}
+
 fn ws_err(e: async_tungstenite::tungstenite::Error) -> io::Error {
     use async_tungstenite::tungstenite::Error as WsError;
     match e {
@@ -92,6 +111,14 @@ where
                     // Empty binary frames fall through to the skip arm and we
                     // fetch the next message.
                     Message::Binary(data) if !data.is_empty() => {
+                        // Belt-and-suspenders: the tungstenite config (`ws_config`)
+                        // already rejects messages over MAX_WS_MESSAGE during
+                        // reassembly, but enforce the invariant in our own code too
+                        // and ERROR (never silently skip — a skip would let an
+                        // attacker burn the allocation and keep the connection up).
+                        if data.len() > limits::MAX_WS_MESSAGE {
+                            return Poll::Ready(Err(io::Error::other("oversized WS message")));
+                        }
                         this.read_buf = Bytes::copy_from_slice(&data[..]);
                     }
                     Message::Close(_) => {
@@ -156,7 +183,7 @@ pub async fn mux_io<T>(io: T, role: Role) -> MuxIo<T>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let ws = WebSocketStream::from_raw_socket(io.compat(), role, None).await;
+    let ws = WebSocketStream::from_raw_socket(io.compat(), role, Some(ws_config())).await;
     WsByteStream::new(ws)
 }
 
@@ -175,7 +202,8 @@ pub async fn mux_io_client<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (ws, _resp) = async_tungstenite::client_async(url, io.compat()).await?;
+    let (ws, _resp) =
+        async_tungstenite::client_async_with_config(url, io.compat(), Some(ws_config())).await?;
     Ok(WsByteStream::new(ws))
 }
 
@@ -322,6 +350,61 @@ mod tests {
             .await
             .expect("1 MiB echo deadlocked — flow control bug");
         assert_eq!(got, payload);
+    }
+
+    /// Build a connected pair of *raw* WsByteStreams (no yamux on top), so a test
+    /// can write hand-sized WS messages from one side and observe the other side's
+    /// `poll_read`. The peer is given an unbounded message cap so the SIZE LIMIT
+    /// being exercised is the one under test (the reader's config), not the writer.
+    async fn ws_pair() -> (
+        WsByteStream<Compat<tokio::io::DuplexStream>>,
+        WebSocketStream<Compat<tokio::io::DuplexStream>>,
+    ) {
+        let (a, b) = tokio::io::duplex(4 * 1024 * 1024);
+        // Reader side: our bounded server stream (uses ws_config()).
+        let reader = mux_io(a, Role::Server).await;
+        // Writer side: a raw tungstenite client with NO message cap, so it will
+        // happily emit an oversized frame for the reader to reject.
+        let writer = WebSocketStream::from_raw_socket(b.compat(), Role::Client, None).await;
+        (reader, writer)
+    }
+
+    #[tokio::test]
+    async fn read_rejects_oversize_ws_message() {
+        let (mut reader, mut writer) = ws_pair().await;
+        // One byte over the cap: must be rejected during reassembly, not buffered.
+        let payload = vec![0u8; limits::MAX_WS_MESSAGE + 1];
+        let send = async move {
+            writer.send(Message::binary(payload)).await.unwrap();
+            // Keep the writer alive long enough for the frame to flush.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            writer
+        };
+        let read = async {
+            let mut buf = vec![0u8; limits::MAX_WS_MESSAGE + 16];
+            reader.read(&mut buf).await
+        };
+        let (_w, res) = futures::future::join(send, read).await;
+        assert!(
+            res.is_err(),
+            "oversize WS message must error on read, not buffer; got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_accepts_max_size_ws_message() {
+        let (mut reader, mut writer) = ws_pair().await;
+        // Exactly at the cap: must be delivered intact (inclusive bound).
+        let payload = vec![0xABu8; limits::MAX_WS_MESSAGE];
+        tokio::spawn(async move {
+            writer.send(Message::binary(payload)).await.unwrap();
+            // Hold open so the reader can drain all of it.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let mut got = vec![0u8; limits::MAX_WS_MESSAGE];
+        reader.read_exact(&mut got).await.unwrap();
+        assert_eq!(got.len(), limits::MAX_WS_MESSAGE);
+        assert!(got.iter().all(|&b| b == 0xAB));
     }
 
     /// Writing far more than the connection receive window to a stream nobody

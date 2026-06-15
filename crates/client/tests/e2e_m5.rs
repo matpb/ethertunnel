@@ -66,6 +66,7 @@ async fn start_relay(ctx: Arc<SessionCtx>, pub_port: u16) -> RelayHandle {
         },
         keygate: None,
         limits: Default::default(),
+        provision: None,
     });
     serve(config, ctx).await.expect("relay starts")
 }

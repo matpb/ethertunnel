@@ -96,11 +96,36 @@ pub struct Registry {
     suffix: String,
 }
 
+/// Best-effort tighten a SQLite database file (and its `-wal`/`-shm` siblings)
+/// to owner-only (0600). Called AFTER `init()` runs `journal_mode=WAL`, because
+/// that pragma is what creates the WAL/SHM files — tightening before would miss
+/// them (and the WAL holds the freshest, uncommitted rows). Errors are swallowed:
+/// the siblings may not exist yet (ENOENT) and a chmod failure must never block
+/// startup. No-op on non-unix targets so the workspace still builds cross-platform.
+#[cfg(unix)]
+pub(crate) fn tighten_sqlite_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    for ext in ["-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(ext);
+        let _ = std::fs::set_permissions(Path::new(&p), std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn tighten_sqlite_perms(_path: &Path) {}
+
 impl Registry {
     /// Open (creating if needed) the registry at `path` for `domain`.
     pub fn open(path: impl AsRef<Path>, domain: &str) -> Result<Self, RegistryError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        Self::init(conn, domain)
+        let me = Self::init(conn, domain)?;
+        // After init() (which created the -wal/-shm via journal_mode=WAL): the
+        // DB holds token hashes + tenant topology and must never be world-readable.
+        tighten_sqlite_perms(path);
+        Ok(me)
     }
 
     /// An in-memory registry, for tests.
@@ -609,6 +634,7 @@ impl Authenticator for Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn reg() -> Registry {
         Registry::open_in_memory("ethertunnel.com").unwrap()
@@ -822,5 +848,134 @@ mod tests {
             Err(RegistryError::UserNotEmpty(_))
         ));
         assert!(r.remove_user("mat", true).is_ok());
+    }
+
+    /// A unique temp path under the system temp dir (no tempfile dep available).
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("etun-test-{tag}-{pid}-{n}.db"))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        for ext in ["-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(ext);
+            let _ = std::fs::remove_file(std::path::Path::new(&p));
+        }
+    }
+
+    /// On-disk registry DB (and its WAL/SHM siblings) must be chmodded 0600 after
+    /// open, so token hashes + tenant topology are never world-readable. (finding 12)
+    ///
+    /// We pin `umask` to 0o022 for the duration of the test so newly created
+    /// files would default to 0o644 (world-readable) WITHOUT the chmod — that is
+    /// what gives this test its discriminating power. If a developer's ambient
+    /// umask were 0o077, files would land at 0o600 on their own and the test
+    /// could pass even with the production chmod removed; setting umask here
+    /// removes that ambiguity. We also assert the WAL/SHM siblings actually
+    /// EXIST (journal_mode=WAL + a forced write materializes both) rather than
+    /// silently skipping them.
+    #[cfg(unix)]
+    #[test]
+    fn open_chmods_db_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: umask is a process-global; this test is the sole writer of the
+        // value during its run and restores it before returning. Cargo runs unit
+        // tests in threads of one process, so keep the window tiny.
+        let prev_umask = unsafe { libc::umask(0o022) };
+
+        let path = temp_db_path("registry");
+        cleanup(&path);
+        let r = Registry::open(&path, "ethertunnel.com").unwrap();
+        // Force a write so the WAL (and its SHM index) actually materialize.
+        r.add_user("mat").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "registry.db must be 0600, was {mode:o}");
+        // Both siblings must exist under WAL mode after a write, and both must be
+        // 0600 — no silent skip.
+        for ext in ["-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(ext);
+            let sib = std::path::Path::new(&p);
+            let meta = std::fs::metadata(sib)
+                .unwrap_or_else(|e| panic!("expected {} to exist: {e}", sib.display()));
+            let m = meta.permissions().mode() & 0o777;
+            assert_eq!(m, 0o600, "{} must be 0600, was {m:o}", sib.display());
+        }
+        drop(r);
+        cleanup(&path);
+
+        // Restore the ambient umask for any sibling tests in this process.
+        unsafe { libc::umask(prev_umask) };
+    }
+
+    /// The in-memory variant has no file: opening it must not attempt a chmod or
+    /// panic. (guards against calling the helper on the :memory: path)
+    #[test]
+    fn open_in_memory_does_not_chmod_or_panic() {
+        let r = Registry::open_in_memory("ethertunnel.com").unwrap();
+        r.add_user("mat").unwrap();
+        assert_eq!(r.list_users().unwrap().len(), 1);
+    }
+
+    /// tighten_sqlite_perms is best-effort: a path whose -wal/-shm don't exist
+    /// (and even a missing main file) must not error or panic.
+    #[cfg(unix)]
+    #[test]
+    fn tighten_sqlite_perms_is_best_effort() {
+        let missing = temp_db_path("nonexistent");
+        cleanup(&missing);
+        // Must not panic even though nothing exists at this path.
+        super::tighten_sqlite_perms(&missing);
+    }
+
+    /// The auditor's exact concurrent-claim PoC, driven against the AUTHORITATIVE
+    /// enforcement layer (`claim_label_capped`, not the racy router pre-check).
+    /// 16 threads sharing one Registry each race a DISTINCT free label under a
+    /// Barrier; the owned-row count must equal CAP exactly (never exceed it), and
+    /// exactly CAP claims succeed. Pins the max_tunnels TOCTOU closed. (finding f7)
+    #[test]
+    fn concurrent_claims_never_exceed_cap() {
+        use std::sync::Barrier;
+        const THREADS: usize = 16;
+        const CAP: i64 = 5;
+
+        let r = Arc::new(Registry::open_in_memory("ethertunnel.com").unwrap());
+        let mat = r.add_user("mat").unwrap();
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|i| {
+                let r = r.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    r.claim_label_capped(mat, &format!("h{i}"), Some(CAP))
+                })
+            })
+            .collect();
+
+        let mut granted = 0;
+        let mut cap_exceeded = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(true) => granted += 1,
+                Err(RegistryError::CapExceeded) => cap_exceeded += 1,
+                other => panic!("unexpected claim outcome: {other:?}"),
+            }
+        }
+        assert_eq!(granted as i64, CAP, "exactly CAP claims must succeed");
+        assert_eq!(cap_exceeded, THREADS - CAP as usize, "the rest hit the cap");
+        assert_eq!(
+            r.count_owned_resources(mat).unwrap(),
+            CAP,
+            "owned-row count must equal CAP exactly, never exceed it"
+        );
     }
 }

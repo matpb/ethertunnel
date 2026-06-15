@@ -35,6 +35,7 @@ fn relay_config(listen: SocketAddr) -> Arc<Config> {
         tcp: Default::default(),
         keygate: None,
         limits: Default::default(),
+        provision: None,
     })
 }
 

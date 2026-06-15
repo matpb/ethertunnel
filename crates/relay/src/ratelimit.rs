@@ -242,4 +242,34 @@ mod tests {
         let _p4 = cl.try_admit(b).expect("slot freed -> b admitted");
         drop(p2);
     }
+
+    #[test]
+    fn session_limiter_caps_and_recovers() {
+        // A SECOND, independent ConnLimiter instance models the live-session cap
+        // (max_sessions / max_sessions_per_ip). It must enforce the same
+        // global + per-/64 ceilings and release on ConnPermit drop, proving the
+        // primitive supports two independent limiters in one process.
+        let sessions = ConnLimiter::new(2, 1); // global 2, per-key 1
+        let a: IpAddr = "2001:db8:7:7::1".parse().unwrap();
+        let a2: IpAddr = "2001:db8:7:7::99".parse().unwrap(); // same /64
+        let b: IpAddr = "198.51.100.5".parse().unwrap();
+
+        let pa = sessions.try_admit(a).expect("1st session from a");
+        // Per-key cap (1) blocks a's /64 even from a different host bit.
+        assert!(
+            sessions.try_admit(a2).is_none(),
+            "per-key session cap should block a's 2nd"
+        );
+        let _pb = sessions.try_admit(b).expect("session from b fills global cap (2)");
+        // Global cap (2) reached.
+        assert!(
+            sessions.try_admit(b).is_none(),
+            "global session cap should block the 3rd"
+        );
+        // Releasing a's permit frees a global + per-key slot, admitting a's /64.
+        drop(pa);
+        let _pa2 = sessions
+            .try_admit(a2)
+            .expect("slot freed -> a's /64 admitted again");
+    }
 }

@@ -10,12 +10,13 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ethertunnel_proto::frames::StreamHeader;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{ConnLimiter, RateLimiter};
 use crate::router::Router;
 
 /// Binds and serves raw-TCP tunnel ports.
@@ -24,16 +25,27 @@ pub struct TcpPortManager {
     port_range: [u16; 2],
     router: Arc<Router>,
     rate: Arc<RateLimiter>,
+    /// Concurrent-connection cap. SHARES the :443 ConnLimiter instance, so raw
+    /// TCP and the control/visitor plane live under one relay-wide global +
+    /// per-/64 fd budget (both listeners share the process fd table).
+    conns: Arc<ConnLimiter>,
+    /// Idle / absolute splice timeouts (None = disabled), mirroring the HTTP path.
+    idle: Option<Duration>,
+    absolute: Option<Duration>,
     cancel: CancellationToken,
     bound: Mutex<HashSet<u16>>,
 }
 
 impl TcpPortManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bind_ip: IpAddr,
         port_range: [u16; 2],
         router: Arc<Router>,
         rate: Arc<RateLimiter>,
+        conns: Arc<ConnLimiter>,
+        idle: Option<Duration>,
+        absolute: Option<Duration>,
         cancel: CancellationToken,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -41,6 +53,9 @@ impl TcpPortManager {
             port_range,
             router,
             rate,
+            conns,
+            idle,
+            absolute,
             cancel,
             bound: Mutex::new(HashSet::new()),
         })
@@ -71,8 +86,17 @@ impl TcpPortManager {
                         if !manager.rate.check(peer.ip()) {
                             continue; // dropped: flooding source
                         }
+                        // Hold a concurrency slot for the whole connection; None =>
+                        // the shared global or per-/64 ceiling is reached. Moved
+                        // into serve_conn so it releases only when the splice ends.
+                        let Some(permit) = manager.conns.try_admit(peer.ip()) else {
+                            tracing::debug!(%peer, port, "tcp connection cap reached; dropping");
+                            continue;
+                        };
                         let manager = manager.clone();
-                        tokio::spawn(async move { manager.serve_conn(port, conn, peer).await });
+                        tokio::spawn(async move {
+                            manager.serve_conn(port, conn, peer, permit).await
+                        });
                     }
                 }
             }
@@ -87,8 +111,12 @@ impl TcpPortManager {
         port: u16,
         mut conn: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
+        // Held for the connection's lifetime; releasing it (on any return path,
+        // including the early returns below) frees the global + per-/64 slot.
+        _permit: crate::ratelimit::ConnPermit,
     ) {
         let _ = conn.set_nodelay(true);
+        crate::listener::set_tcp_keepalive(&conn);
         let Some(session) = self.router.lookup_tcp(port) else {
             return; // no current owner; drop
         };
@@ -107,8 +135,16 @@ impl TcpPortManager {
             }
         };
         // `DataStream` is a compat-wrapped yamux stream — already a tokio
-        // AsyncRead/AsyncWrite, so it splices directly.
+        // AsyncRead/AsyncWrite, so it splices directly. The idle/absolute timeout
+        // (cross-direction) reclaims a silent held socket so it cannot pin the
+        // permit + yamux slot forever.
         let mut data = stream;
-        let _ = tokio::io::copy_bidirectional(&mut conn, &mut data).await;
+        let _ = crate::proxy::copy_bidirectional_timeout(
+            &mut conn,
+            &mut data,
+            self.idle,
+            self.absolute,
+        )
+        .await;
     }
 }

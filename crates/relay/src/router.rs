@@ -186,13 +186,16 @@ impl Router {
 
     /// Count the distinct active tunnels (hostnames + TCP ports) `user_id` would
     /// hold *after* additionally claiming `new_hosts`/`new_ports`. Re-claims of
-    /// resources the user already holds do not double-count (set union). Used to
-    /// enforce a per-customer `max_tunnels` cap at claim time.
+    /// resources the user already holds do not double-count (set union).
     ///
-    /// There is an inherent ±1 race here (the count is read before the claim is
-    /// applied under a separate lock); it is accepted as benign — it can only
-    /// ever let through one extra tunnel against a quota, never wrongly deny an
-    /// owner their resources.
+    /// DIAGNOSTICS / cheap early-out ONLY — **not a security boundary.** The
+    /// authoritative per-account cap is enforced on OWNED registry rows inside
+    /// [`Registry::claim_label_capped`](crate::registry::Registry::claim_label_capped),
+    /// atomically with the INSERT (commit 2a6ab14). This count is racy (it is read
+    /// under a read lock here while the real claim takes a separate write lock) and
+    /// may transiently over- or under-count under concurrent claims; never rely on
+    /// it to enforce a quota. It survives only to reject obvious over-claims one DB
+    /// round-trip sooner.
     pub fn projected_tunnel_count(
         &self,
         user_id: i64,

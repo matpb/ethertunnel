@@ -132,11 +132,29 @@ pub async fn serve_with(
         config.limits.max_connections,
         config.limits.max_connections_per_ip,
     );
+    // The live-session cap: held for each control session's whole lifetime, so
+    // the post-101 daemon population is actually bounded (the accept ConnPermit
+    // can't reach inside the `Fn` service). Installed on the shared SessionCtx.
+    let session_limiter = ConnLimiter::new(
+        config.limits.max_sessions,
+        config.limits.max_sessions_per_ip,
+    );
+    ctx.set_session_limiter(session_limiter);
+    ctx.set_token_revalidate_interval_secs(config.limits.token_revalidate_interval_secs);
+    let tcp_idle = (config.limits.proxy_idle_timeout_secs > 0)
+        .then(|| Duration::from_secs(config.limits.proxy_idle_timeout_secs));
+    let tcp_absolute = (config.limits.proxy_absolute_max_secs > 0)
+        .then(|| Duration::from_secs(config.limits.proxy_absolute_max_secs));
     let tcp_manager = TcpPortManager::new(
         local_addr.ip(),
         config.tcp.port_range,
         ctx.router.clone(),
         rate.clone(),
+        // SHARE the :443 ConnLimiter: one relay-wide global + per-/64 fd budget
+        // spans both planes (they share the process fd table).
+        conn_limiter.clone(),
+        tcp_idle,
+        tcp_absolute,
         cancel.clone(),
     );
     ctx.set_tcp(tcp_manager);
@@ -208,6 +226,21 @@ pub async fn serve_with(
     })
 }
 
+/// Enable TCP keepalive on a relay-side socket so a peer that vanishes without a
+/// FIN/RST is detected and the socket (and its concurrency slot) reclaimed. This
+/// is the data-plane counterpart to the control channel's app-level ping/pong:
+/// the kernel probes the peer without touching the tunneled bytes, so a
+/// live-but-idle connection is never harmed (a live peer answers the probes).
+pub(crate) fn set_tcp_keepalive(stream: &tokio::net::TcpStream) {
+    use ethertunnel_proto::limits::{TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL};
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    // Best-effort: a relay that cannot set keepalive still works, just without the
+    // dead-peer reclaim.
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&ka);
+}
+
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
@@ -215,13 +248,20 @@ async fn handle_conn(
     ctx: Arc<SessionCtx>,
     config: Arc<Config>,
     cancel: CancellationToken,
-    // Held until this connection's pre-upgrade HTTP exchange ends (or the whole
-    // keep-alive connection for plain visitor traffic), releasing the
-    // concurrency slot on drop. Established daemon sessions outlive this — they
-    // are bounded instead by auth + the pre-control-stream deadline + dead-man.
-    _permit: ConnPermit,
+    // The accept-time concurrency slot. For plain keep-alive HTTP it is released
+    // when this connection's exchange ends. For an UPGRADE (visitor WS splice or
+    // daemon control session) it is re-homed onto the longer-lived task so the
+    // slot is held across the whole splice/session instead of being freed at the
+    // 101 — closing the "every long-lived connection escapes max_connections"
+    // hole. The permit is carried in a shared cell because the hyper service is an
+    // `Fn` closure that cannot own a move-only `ConnPermit`; it is `.take()`-n
+    // exactly once on the upgrade branch (a connection is never both keep-alive
+    // HTTP and an upgrade, so taking once is sound). If never taken, the cell
+    // drops here and releases the slot as before.
+    permit: ConnPermit,
 ) {
     let _ = stream.set_nodelay(true);
+    set_tcp_keepalive(&stream);
     let tls = match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
@@ -235,13 +275,17 @@ async fn handle_conn(
     };
 
     let header_read_timeout_secs = config.limits.header_read_timeout_secs;
+    // Shared cell carrying the accept permit into the request router so it can be
+    // re-homed onto an upgrade's long-lived task. See the `permit` doc above.
+    let permit_cell: proxy::PermitCell = Arc::new(std::sync::Mutex::new(Some(permit)));
     let service = {
         let cancel = cancel.clone();
         service_fn(move |req| {
             let ctx = ctx.clone();
             let config = config.clone();
             let cancel = cancel.clone();
-            async move { route(req, ctx, config, peer, cancel).await }
+            let permit_cell = permit_cell.clone();
+            async move { route(req, ctx, config, peer, cancel, permit_cell).await }
         })
     };
 
@@ -279,6 +323,7 @@ async fn route(
     config: Arc<Config>,
     peer: std::net::SocketAddr,
     cancel: CancellationToken,
+    permit_cell: proxy::PermitCell,
 ) -> Result<proxy::Resp, std::convert::Infallible> {
     let host = host_of(&req);
 
@@ -291,7 +336,7 @@ async fn route(
         if crate::admin_http::is_admin_request(&ctx, &req) {
             return Ok(crate::admin_http::handle(ctx, req).await);
         }
-        return Ok(handle_control_upgrade(&mut req, ctx, cancel));
+        return Ok(handle_control_upgrade(&mut req, ctx, peer, cancel, permit_cell));
     }
 
     if host.as_deref() == Some(config.apex()) {
@@ -303,9 +348,16 @@ async fn route(
     }
 
     match host {
-        Some(host) if config.is_tunnel_host(&host) => {
-            Ok(proxy::proxy_http(req, ctx, host, peer.ip(), peer.port()).await)
-        }
+        Some(host) if config.is_tunnel_host(&host) => Ok(proxy::proxy_http(
+            req,
+            ctx,
+            host,
+            peer.ip(),
+            peer.port(),
+            config.limits.clone().into(),
+            permit_cell,
+        )
+        .await),
         _ => Ok(proxy::page(
             StatusCode::NOT_FOUND,
             "text/plain; charset=utf-8",
@@ -319,7 +371,9 @@ async fn route(
 fn handle_control_upgrade(
     req: &mut Request<hyper::body::Incoming>,
     ctx: Arc<SessionCtx>,
+    peer: std::net::SocketAddr,
     cancel: CancellationToken,
+    permit_cell: proxy::PermitCell,
 ) -> proxy::Resp {
     if req.method() != Method::GET || !is_websocket_upgrade(req) {
         return proxy::page(
@@ -340,8 +394,35 @@ fn handle_control_upgrade(
         );
     };
 
+    // Acquire a LIVE-SESSION permit before committing to the 101. Held for the
+    // whole session lifetime (moved into the spawn below), it count-bounds the
+    // post-upgrade daemon population that previously escaped max_connections.
+    // When no limiter is installed (tests without a listener), sessions are
+    // unbounded, preserving existing behavior.
+    let session_permit = match ctx.session_limiter.load_full() {
+        Some(limiter) => match limiter.try_admit(peer.ip()) {
+            Some(p) => Some(p),
+            None => {
+                tracing::debug!(%peer, "session cap reached; refusing control upgrade");
+                return proxy::page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "text/plain; charset=utf-8",
+                    "relay at capacity",
+                );
+            }
+        },
+        None => None,
+    };
+
+    // The accept-time permit is no longer needed past the 101 on the control
+    // path: the session is now count-bounded by `session_permit`. Take it from
+    // the cell so it is released when this exchange ends (it is NOT carried into
+    // the session — that would double-count one connection against both caps).
+    let _ = permit_cell.lock().unwrap().take();
+
     let upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
+        let _session_permit = session_permit; // held for the session's whole life
         match upgrade.await {
             Ok(upgraded) => {
                 let io = mux_io(TokioIo::new(upgraded), Role::Server).await;

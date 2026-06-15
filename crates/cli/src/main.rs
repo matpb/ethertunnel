@@ -217,6 +217,20 @@ enum PortCmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Lock the process umask to 0o077 before anything touches the filesystem, so
+    // every file/dir this binary creates is owner-only out of the box — the
+    // relay's registry DB, ACME private keys and provision token, and the
+    // client's stored bearer credentials. The systemd unit sets UMask=0077 and
+    // the Docker image runs non-root, but this also covers manual launches
+    // (`./etun serve`, `etun login`) that go through neither.
+    #[cfg(unix)]
+    // SAFETY: umask() is always successful and only reads/replaces a per-process
+    // value; called here at the very start of `main`, before any threads spawn or
+    // files are opened.
+    unsafe {
+        libc::umask(0o077);
+    }
+
     let cli = Cli::parse();
     // Route logs by mode: a service uses journald (Linux) or a rolling file
     // (macOS/Windows); everything else logs to the TTY.

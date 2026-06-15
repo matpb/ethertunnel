@@ -73,6 +73,33 @@ pub struct LimitsConfig {
     /// the TLS handshake. Bounds slowloris; 0 disables.
     #[serde(default = "default_header_read_timeout_secs")]
     pub header_read_timeout_secs: u64,
+    /// Hard ceiling on concurrent *live* daemon control sessions process-wide.
+    /// A control session holds its permit for its whole lifetime (not just the
+    /// pre-upgrade HTTP phase), so this is what actually bounds the post-101
+    /// daemon population. Defaults to `max_connections`.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+    /// Max concurrent live control sessions per source key (IPv6 keyed by /64).
+    /// Defaults to `max_connections_per_ip`.
+    #[serde(default = "default_max_sessions_per_ip")]
+    pub max_sessions_per_ip: u32,
+    /// Tear down a visitor splice / proxied body after this many seconds with
+    /// zero bytes in *either* direction. Reset-on-activity, so busy long-lived
+    /// WebSockets are unaffected. 0 disables — and 0 is the default: idle
+    /// connections are NEVER reaped out of the box (a quiet-but-alive raw-TCP /
+    /// SSH / DB tunnel must survive). The now-enforced concurrency caps bound the
+    /// DoS; set this (e.g. 60) only on relays that serve solely keepalive traffic.
+    #[serde(default = "default_proxy_idle_timeout_secs")]
+    pub proxy_idle_timeout_secs: u64,
+    /// Absolute ceiling (seconds) on a single visitor splice regardless of
+    /// activity. 0 disables — the default, so legitimate long-lived tunnels are
+    /// never severed out of the box (3600 is the documented hardened value).
+    #[serde(default = "default_proxy_absolute_max_secs")]
+    pub proxy_absolute_max_secs: u64,
+    /// How often (seconds) an established control session re-validates its bearer
+    /// token, so an admin revocation takes effect within one interval. 0 disables.
+    #[serde(default = "default_token_revalidate_interval_secs")]
+    pub token_revalidate_interval_secs: u64,
 }
 
 impl Default for LimitsConfig {
@@ -81,6 +108,11 @@ impl Default for LimitsConfig {
             max_connections: default_max_connections(),
             max_connections_per_ip: default_max_connections_per_ip(),
             header_read_timeout_secs: default_header_read_timeout_secs(),
+            max_sessions: default_max_sessions(),
+            max_sessions_per_ip: default_max_sessions_per_ip(),
+            proxy_idle_timeout_secs: default_proxy_idle_timeout_secs(),
+            proxy_absolute_max_secs: default_proxy_absolute_max_secs(),
+            token_revalidate_interval_secs: default_token_revalidate_interval_secs(),
         }
     }
 }
@@ -95,6 +127,26 @@ fn default_max_connections_per_ip() -> u32 {
 
 fn default_header_read_timeout_secs() -> u64 {
     10
+}
+
+fn default_max_sessions() -> usize {
+    4096
+}
+
+fn default_max_sessions_per_ip() -> u32 {
+    64
+}
+
+fn default_proxy_idle_timeout_secs() -> u64 {
+    0
+}
+
+fn default_proxy_absolute_max_secs() -> u64 {
+    0
+}
+
+fn default_token_revalidate_interval_secs() -> u64 {
+    60
 }
 
 /// keygate licensing integration. When present, the relay pulls signed
@@ -335,5 +387,57 @@ impl Config {
             return false; // apex-only or deeper than one level
         }
         !crate::registry::RESERVED_LABELS.contains(&label)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relay.toml written before the security hardening (no `[limits]` block,
+    /// or a `[limits]` block missing the new fields) must still load, with every
+    /// new knob falling back to its ratified default.
+    #[test]
+    fn limits_back_compat_old_config_loads_with_defaults() {
+        // No [limits] table at all — the whole section is `#[serde(default)]`.
+        let toml = r#"
+            [server]
+            domain = "example.com"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("old config without [limits] loads");
+        let l = &cfg.limits;
+        assert_eq!(l.max_connections, 4096);
+        assert_eq!(l.max_connections_per_ip, 64);
+        assert_eq!(l.header_read_timeout_secs, 10);
+        // New fields default to the ratified values.
+        assert_eq!(l.max_sessions, 4096);
+        assert_eq!(l.max_sessions_per_ip, 64);
+        assert_eq!(l.proxy_idle_timeout_secs, 0); // idle reaping OFF by default — never kill idle connections
+        assert_eq!(l.proxy_absolute_max_secs, 0); // disabled by default
+        assert_eq!(l.token_revalidate_interval_secs, 60);
+    }
+
+    /// A `[limits]` block that sets only the *old* fields still loads; the new
+    /// fields are filled field-by-field from their defaults.
+    #[test]
+    fn limits_partial_block_fills_new_fields() {
+        let toml = r#"
+            [server]
+            domain = "example.com"
+
+            [limits]
+            max_connections = 1000
+            max_connections_per_ip = 10
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("partial [limits] loads");
+        let l = &cfg.limits;
+        assert_eq!(l.max_connections, 1000);
+        assert_eq!(l.max_connections_per_ip, 10);
+        // Untouched new knobs keep their defaults.
+        assert_eq!(l.max_sessions, 4096);
+        assert_eq!(l.max_sessions_per_ip, 64);
+        assert_eq!(l.proxy_idle_timeout_secs, 0); // idle reaping OFF by default
+        assert_eq!(l.proxy_absolute_max_secs, 0);
+        assert_eq!(l.token_revalidate_interval_secs, 60);
     }
 }

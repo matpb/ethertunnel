@@ -47,3 +47,32 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// which the relay lowercases and ownership-checks; this bounds that per-claim
 /// work. A daemon needing more simply sends additional claims.
 pub const MAX_CLAIM_ENTRIES: usize = 256;
+
+/// Default idle timeout for a visitor splice / body: tear it down after this
+/// long with zero bytes in *either* direction. Reset-on-activity, so a busy
+/// long-lived WebSocket is never cut. The relay config can override (0 = off).
+pub const PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default absolute ceiling on a single visitor splice regardless of activity.
+/// Shipped DISABLED by default (the relay config maps 0 -> off) so no legitimate
+/// long-lived tunnel is ever severed; documented hardened value is 3600s.
+pub const PROXY_ABSOLUTE_MAX: Duration = Duration::from_secs(3600);
+
+/// Default cadence at which an established control session re-validates its
+/// bearer token against the registry, so an admin revocation takes effect within
+/// one interval instead of persisting until the daemon disconnects.
+pub const TOKEN_REVALIDATE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// TCP keepalive idle time on relay-side visitor + raw-TCP sockets. After this
+/// long with no data, the kernel starts probing the peer. This reclaims sockets
+/// whose peer vanished without a FIN/RST (the visitor data planes are opaque
+/// byte pipes, so we cannot ping/pong inside them the way the control channel
+/// does) WITHOUT ever cutting a live-but-idle tunnel — a live peer answers the
+/// kernel probes. Pairs with the (default-off) app idle timeout, never replacing
+/// the rule that quiet-but-alive connections must survive.
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+
+/// Interval between TCP keepalive probes once the idle time has elapsed. With the
+/// OS default probe count, a truly-dead peer is detected and dropped a few
+/// minutes after it goes silent.
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);

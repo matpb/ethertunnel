@@ -26,6 +26,7 @@ use ethertunnel_proto::codec::{self, CodecError};
 use ethertunnel_proto::frames::{ControlFrame, DenyCode, StreamHeader};
 use ethertunnel_proto::limits::{
     HELLO_TIMEOUT, MAX_CONTROL_FRAME, MAX_STREAM_HEADER, SESSION_DEAD_AFTER,
+    TOKEN_REVALIDATE_INTERVAL,
 };
 use ethertunnel_proto::transport::MuxIo;
 use ethertunnel_proto::PROTOCOL_VERSION;
@@ -80,6 +81,18 @@ pub struct SessionCtx {
     /// `[provision]` is configured. `None` means the `/admin/*` provisioning
     /// endpoints are not mounted (the relay has no inbound control API).
     pub provision: arc_swap::ArcSwapOption<crate::admin_http::ProvisionState>,
+    /// Caps concurrent *live* daemon control sessions (global + per-/64), held
+    /// for each session's whole lifetime. Separate from the accept-time
+    /// ConnLimiter (which the move-only ConnPermit can't reach inside the `Fn`
+    /// service): the upgrade path acquires a permit here, before spawning
+    /// `run_session`, and refuses with 503 when exhausted. `None` (the default,
+    /// e.g. tests with no listener) means unlimited live sessions.
+    pub session_limiter: arc_swap::ArcSwapOption<crate::ratelimit::ConnLimiter>,
+    /// How often an established control session re-validates its bearer token so
+    /// an admin revocation takes effect within one interval. `Duration::ZERO`
+    /// disables re-validation (revocation then only takes effect at reconnect).
+    /// Defaults to [`TOKEN_REVALIDATE_INTERVAL`]; `serve` overrides from config.
+    pub token_revalidate_interval: std::sync::atomic::AtomicU64,
     next_session_id: AtomicU64,
 }
 
@@ -96,8 +109,29 @@ impl SessionCtx {
             tcp: arc_swap::ArcSwapOption::empty(),
             entitlements: arc_swap::ArcSwapOption::empty(),
             provision: arc_swap::ArcSwapOption::empty(),
+            session_limiter: arc_swap::ArcSwapOption::empty(),
+            token_revalidate_interval: AtomicU64::new(
+                TOKEN_REVALIDATE_INTERVAL.as_millis() as u64,
+            ),
             next_session_id: AtomicU64::new(1),
         })
+    }
+
+    /// Install the live-session limiter (called by `serve` once the configured
+    /// caps are known). Until installed, live sessions are unbounded.
+    pub fn set_session_limiter(&self, limiter: Arc<crate::ratelimit::ConnLimiter>) {
+        self.session_limiter.store(Some(limiter));
+    }
+
+    /// Set the token re-validation cadence (seconds; 0 disables). Called by
+    /// `serve` from `token_revalidate_interval_secs`.
+    pub fn set_token_revalidate_interval_secs(&self, secs: u64) {
+        self.token_revalidate_interval
+            .store(secs.saturating_mul(1000), Ordering::Relaxed);
+    }
+
+    fn token_revalidate_interval(&self) -> Duration {
+        Duration::from_millis(self.token_revalidate_interval.load(Ordering::Relaxed))
     }
 
     /// Install the keygate provisioning control plane (called by `run_serve`
@@ -343,14 +377,57 @@ async fn control_task(
         .await;
     tracing::info!(session_id, user = %user.name, proto, "session authenticated");
 
-    // --- Steady-state loop with heartbeat dead-man ---
+    // --- Steady-state loop with heartbeat dead-man + token re-validation ---
+    // The read future carries the 90s silence dead-man; a separate interval ticks
+    // the bearer-token re-check so an admin `token revoke` (or user deletion)
+    // takes effect within one interval instead of persisting until the daemon
+    // voluntarily disconnects. The interval branch must NOT consume the read
+    // future (it runs concurrently and the read resumes after each tick).
+    let revalidate = ctx.token_revalidate_interval();
+    let mut revalidate_tick = tokio::time::interval(if revalidate.is_zero() {
+        // Disabled: a far-future cadence that effectively never fires.
+        Duration::from_secs(60 * 60 * 24 * 365)
+    } else {
+        revalidate
+    });
+    revalidate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first immediate tick is consumed up front so we don't re-auth instantly.
+    revalidate_tick.tick().await;
     loop {
-        let frame = match tokio::time::timeout(
+        let read = tokio::time::timeout(
             SESSION_DEAD_AFTER,
             codec::read_frame::<_, ControlFrame>(rd, MAX_CONTROL_FRAME),
-        )
-        .await
-        {
+        );
+        tokio::pin!(read);
+        let frame = loop {
+            tokio::select! {
+                biased;
+                r = &mut read => break r,
+                _ = revalidate_tick.tick(), if !revalidate.is_zero() => {
+                    // Re-resolve the token. None (revoked/deleted) or a different
+                    // user_id (token reissued to another user) => terminate.
+                    match ctx.auth.authenticate(token.expose()) {
+                        Some(u) if u.user_id == user.user_id => continue,
+                        _ => {
+                            tracing::info!(session_id, "token revoked; closing session");
+                            let _ = ctrl_tx
+                                .send(ControlFrame::Denied {
+                                    code: DenyCode::AuthFailed,
+                                    message: "token revoked".into(),
+                                })
+                                .await;
+                            // Best-effort: give the writer task a beat to flush the
+                            // Denied to the wire while the actor is still driving
+                            // the yamux connection (it only transmits while polled).
+                            // Returning immediately would cancel before the flush.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        };
+        let frame = match frame {
             Err(_) => {
                 tracing::debug!(session_id, "heartbeat dead-man fired");
                 return Ok(());
@@ -423,6 +500,10 @@ async fn handle_claim(
                 .await;
             return;
         };
+        // TCP ports are admin-granted only (there is no self-service port-claim
+        // path), so they are not subject to the self-service `max_tunnels` claim
+        // cap that hostnames go through — a user cannot self-inflate the port
+        // count past an admin grant. This asymmetry with hostnames is intentional.
         if !manager.in_range(*port) || !ctx.auth.owns_port(user.user_id, *port) {
             let _ = ctrl_tx
                 .send(ControlFrame::Denied {
@@ -966,6 +1047,139 @@ mod tests {
                 .session_id,
             s2
         );
+    }
+
+    /// A token revoked AFTER a session is established must terminate that live
+    /// session within one re-validation interval — *even while the daemon keeps
+    /// heartbeating*. This is the load-bearing scenario: a continuously pinging
+    /// daemon resets the 90s silence dead-man on every Ping, so the dead-man can
+    /// NEVER fire. The ONLY thing that can end such a session is the token
+    /// re-validation tick. We prove that by:
+    ///   1. spawning a daemon that Pings every 5s forever (dead-man stays reset),
+    ///   2. revoking the token out-of-band,
+    ///   3. asserting the route is torn down within ~2x the 10s revalidate
+    ///      interval, wrapped in a 40s timeout set WELL BELOW the 90s dead-man.
+    ///
+    /// On pre-fix code (no re-validation), the heartbeating daemon keeps the
+    /// dead-man reset indefinitely, so the route would never drop and this
+    /// 40s-bounded wait would time out and FAIL. (finding 13)
+    #[tokio::test(start_paused = true)]
+    async fn revoked_token_terminates_live_session() {
+        let (ctx, router, auth, _uid) = fixture();
+        // Tight re-validation cadence so the test fires quickly under paused time.
+        const REVALIDATE_SECS: u64 = 10;
+        ctx.set_token_revalidate_interval_secs(REVALIDATE_SECS);
+        assert!(
+            REVALIDATE_SECS * 4 < SESSION_DEAD_AFTER.as_secs(),
+            "the bound must sit well below the dead-man or the test wouldn't \
+             distinguish revalidation from the dead-man"
+        );
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["myapp.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
+
+        // Spawn a daemon that heartbeats every 5s FOREVER. Each Ping is a read on
+        // the relay side, which resets the 90s dead-man — so the dead-man cannot
+        // be what ends this session. The task also drains inbound frames (the
+        // relay's Pong / the Denied) so the relay writer never stalls. It runs
+        // until the relay tears the stream down, at which point the writes/reads
+        // error out and the loop exits.
+        let heartbeat = tokio::spawn(async move {
+            let mut nonce = 0u64;
+            loop {
+                tokio::select! {
+                    biased;
+                    // Surface relay->daemon frames (Pong, Denied) and detect close.
+                    r = codec::read_frame::<_, ControlFrame>(&mut ctrl, MAX_CONTROL_FRAME) => {
+                        if r.is_err() {
+                            break; // stream closed -> session torn down
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        if codec::write_frame(
+                            &mut ctrl,
+                            &ControlFrame::Ping { nonce },
+                            MAX_CONTROL_FRAME,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break; // write failed -> stream gone
+                        }
+                        nonce += 1;
+                    }
+                }
+            }
+        });
+
+        // Revoke out-of-band. The next re-validation tick (<=10s away) must kill
+        // the session even though the daemon is healthy and heartbeating.
+        assert!(auth.revoke("etun_good"));
+
+        // The authoritative effect: the route is released via remove_session. We
+        // poll for it, bounded to 40s of virtual time — comfortably more than two
+        // revalidate intervals but far below the 90s dead-man. On pre-fix code
+        // (no revalidation) this wait can only be satisfied by the dead-man, which
+        // the live heartbeat keeps resetting, so it would hit the timeout.
+        let torn_down = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if router.lookup_http("myapp.ethertunnel.com").is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        assert!(
+            torn_down.is_ok(),
+            "revoked session's route must be torn down within ~2x the revalidate \
+             interval (well under the dead-man) — a heartbeating revoked session \
+             must not survive"
+        );
+
+        // The daemon's side observes the stream close shortly after.
+        let _ = tokio::time::timeout(Duration::from_secs(5), heartbeat).await;
+    }
+
+    /// Happy path: a session whose token is NOT revoked survives multiple
+    /// re-validation ticks and keeps its route.
+    #[tokio::test(start_paused = true)]
+    async fn unrevoked_session_survives_revalidation_ticks() {
+        let (ctx, router, _auth, _uid) = fixture();
+        ctx.set_token_revalidate_interval_secs(10);
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["myapp.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+
+        // Heartbeat across several revalidation intervals; the session must stay
+        // up and the route must remain. (Each Ping resets the dead-man too.)
+        for nonce in 0..5u64 {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            send(&mut ctrl, ControlFrame::Ping { nonce }).await;
+            match recv(&mut ctrl).await {
+                ControlFrame::Pong { nonce: n } => assert_eq!(n, nonce),
+                other => panic!("expected Pong, got {other:?}"),
+            }
+        }
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
     }
 
     /// With no heartbeat, the relay's dead-man closes the session after

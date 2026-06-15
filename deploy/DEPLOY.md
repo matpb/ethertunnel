@@ -2,7 +2,7 @@
 
 A relay is one static binary on a small public VPS. These notes cover a fresh
 deployment on Ubuntu using systemd (the binary + systemd path; the Docker image
-in `Dockerfile` is an alternative).
+in `Dockerfile` is an alternative — see [Docker](#docker) below).
 
 ## Prerequisites
 
@@ -132,6 +132,35 @@ a drop-in — `sudo systemctl edit etun.service` and add:
 
 The daemon's `ETUN_TOKEN_FILE` read is best-effort, so it falls through cleanly
 to the `ETUN_TOKEN` env value.
+
+## Docker
+
+The image in `deploy/Dockerfile` ships the static `etun` binary on `scratch` and
+runs it as a **non-root** user (uid:gid `65532:65532`, the distroless `nonroot`
+convention) — parity with the systemd unit's `User=etun`.
+
+    docker build -f deploy/Dockerfile -t ethertunnel/relay .
+    docker run --cap-drop ALL --cap-add NET_BIND_SERVICE -p 443:443 \
+        -v /etc/ethertunnel:/etc/ethertunnel \
+        -v /var/lib/ethertunnel:/var/lib/ethertunnel \
+        ethertunnel/relay
+
+`:443` stays **internal** to the container. Because a non-root process cannot
+bind a privileged port without help, the runtime must grant
+`CAP_NET_BIND_SERVICE` (`--cap-add NET_BIND_SERVICE`, or the equivalent
+`securityContext.capabilities.add` in k8s). **Omitting `--cap-add
+NET_BIND_SERVICE` makes the relay fail at startup with `EACCES` on
+`bind(0.0.0.0:443)`.** `--cap-drop ALL` mirrors the systemd unit's
+`CapabilityBoundingSet=CAP_NET_BIND_SERVICE` (that is the only capability the
+relay needs).
+
+Any **mounted volumes** — the Cloudflare token under `/etc/ethertunnel`, and the
+cert/registry state dir `/var/lib/ethertunnel` — must be **readable/owned by uid
+65532** (and writable for the state dir), or the container hits `EACCES` reading
+the token / persisting the registry DB and issued certs:
+
+    chown -R 65532:65532 /etc/ethertunnel /var/lib/ethertunnel
+    chmod 600 /etc/ethertunnel/cloudflare.token   # owner (65532) read-only
 
 ## Backups
 

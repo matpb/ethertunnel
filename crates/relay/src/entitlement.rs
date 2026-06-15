@@ -156,7 +156,12 @@ pub struct EntitlementCache {
 
 impl EntitlementCache {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
-        Self::init(Connection::open(path)?)
+        let path = path.as_ref();
+        let me = Self::init(Connection::open(path)?)?;
+        // Same rationale as the registry: chmod after init() (journal_mode=WAL
+        // created the -wal/-shm). The keygate cache holds customer entitlements.
+        crate::registry::tighten_sqlite_perms(path);
+        Ok(me)
     }
 
     pub fn open_in_memory() -> Result<Self, rusqlite::Error> {
@@ -613,5 +618,48 @@ mod tests {
         let env = envelope(&sk, p);
         gate.ingest(std::slice::from_ref(&env), now_unix());
         assert_eq!(gate.cap_for("mat", now_unix()), CapDecision::DenyAll);
+    }
+
+    /// On-disk entitlement cache (+ WAL/SHM) must be chmodded 0600 after open —
+    /// it holds customer entitlements. (finding 12)
+    #[cfg(unix)]
+    #[test]
+    fn open_chmods_cache_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("etun-test-keygate-{}-{n}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let cache = EntitlementCache::open(&path).unwrap();
+        // Force a write so the WAL materializes.
+        cache
+            .upsert(&Entitlement {
+                external_ref: "mat".into(),
+                customer_id: 1,
+                max_tunnels: Some(1),
+                status: "active".into(),
+                issued_at: 0,
+                expires_at: i64::MAX,
+                updated_at: 0,
+            })
+            .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "keygate-cache.db must be 0600, was {mode:o}");
+        for ext in ["-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(ext);
+            let sib = std::path::Path::new(&p);
+            if let Ok(meta) = std::fs::metadata(sib) {
+                let m = meta.permissions().mode() & 0o777;
+                assert_eq!(m, 0o600, "{} must be 0600, was {m:o}", sib.display());
+            }
+            let _ = std::fs::remove_file(sib);
+        }
+        drop(cache);
+        let _ = std::fs::remove_file(&path);
     }
 }
