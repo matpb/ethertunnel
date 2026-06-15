@@ -851,6 +851,9 @@ mod tests {
     }
 
     /// A unique temp path under the system temp dir (no tempfile dep available).
+    /// Only the `#[cfg(unix)]` permission tests use this, so gate it too — else
+    /// it's dead code on Windows and `-D warnings` fails the build.
+    #[cfg(unix)]
     fn temp_db_path(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -859,6 +862,7 @@ mod tests {
         std::env::temp_dir().join(format!("etun-test-{tag}-{pid}-{n}.db"))
     }
 
+    #[cfg(unix)]
     fn cleanup(path: &std::path::Path) {
         let _ = std::fs::remove_file(path);
         for ext in ["-wal", "-shm"] {

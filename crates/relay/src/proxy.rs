@@ -135,7 +135,10 @@ impl ActivityClock {
         self.last_ms.store(self.now_ms(), Ordering::Relaxed);
     }
     fn idle_for(&self) -> Duration {
-        Duration::from_millis(self.now_ms().saturating_sub(self.last_ms.load(Ordering::Relaxed)))
+        Duration::from_millis(
+            self.now_ms()
+                .saturating_sub(self.last_ms.load(Ordering::Relaxed)),
+        )
     }
 }
 
@@ -180,7 +183,11 @@ where
     // Sub-idle tick granularity so the idle bound fires promptly (and so short
     // idle windows in tests are observed). Capped at 1s for production cheapness.
     let tick_period = idle
-        .map(|d| (d / 4).max(Duration::from_millis(10)).min(Duration::from_secs(1)))
+        .map(|d| {
+            (d / 4)
+                .max(Duration::from_millis(10))
+                .min(Duration::from_secs(1))
+        })
         .unwrap_or(Duration::from_secs(1));
     let mut tick = tokio::time::interval(tick_period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -294,7 +301,9 @@ impl<S> IdleTimeout<S> {
     }
     fn rearm(&mut self) {
         if let Some(idle) = self.idle {
-            self.deadline.as_mut().reset(tokio::time::Instant::now() + idle);
+            self.deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + idle);
         }
     }
     /// Poll the idle deadline; `Ready` means we've been quiet too long.
@@ -355,17 +364,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeout<S> {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -558,13 +561,7 @@ mod tests {
         let (mut a, a_far) = tokio::io::duplex(1024);
         let (mut b, b_far) = tokio::io::duplex(1024);
         let splice = tokio::spawn(async move {
-            copy_bidirectional_timeout(
-                &mut a,
-                &mut b,
-                Some(Duration::from_millis(100)),
-                None,
-            )
-            .await
+            copy_bidirectional_timeout(&mut a, &mut b, Some(Duration::from_millis(100)), None).await
         });
         // Advance virtual time past the idle window. The watchdog tick is
         // (idle/4).clamp(10ms, 1s); for the 100ms idle here that is ~25ms, so a
@@ -601,7 +598,8 @@ mod tests {
                 b_far.write_all(b"ping").await.unwrap();
                 b_far.flush().await.unwrap();
                 // Drain the forwarded bytes on a_far so buffers don't back up.
-                let _ = tokio::time::timeout(Duration::from_millis(10), a_far.read(&mut sink)).await;
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(10), a_far.read(&mut sink)).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             // Both ends drop here -> clean EOF in both directions. The splice must
@@ -660,7 +658,9 @@ mod tests {
         let (mut a, mut a_far) = tokio::io::duplex(1024);
         let (mut b, mut b_far) = tokio::io::duplex(1024);
         let splice =
-            tokio::spawn(async move { copy_bidirectional_timeout(&mut a, &mut b, None, None).await });
+            tokio::spawn(
+                async move { copy_bidirectional_timeout(&mut a, &mut b, None, None).await },
+            );
         a_far.write_all(b"hello").await.unwrap();
         a_far.shutdown().await.unwrap();
         drop(a_far);
@@ -699,7 +699,10 @@ mod tests {
         let ip = "203.0.113.10".parse().unwrap();
         let permit = limiter.try_admit(ip).expect("admit");
         let cell: PermitCell = Arc::new(std::sync::Mutex::new(Some(permit)));
-        assert!(cell.lock().unwrap().take().is_some(), "first take yields permit");
+        assert!(
+            cell.lock().unwrap().take().is_some(),
+            "first take yields permit"
+        );
         assert!(
             cell.lock().unwrap().take().is_none(),
             "second take yields None (take-once)"

@@ -106,7 +106,10 @@ async fn tls_connect(
     tcp.set_nodelay(true).ok();
     let connector = TlsConnector::from(cfg);
     let server_name = ServerName::try_from(CONNECT_HOST.to_owned()).unwrap();
-    connector.connect(server_name, tcp).await.expect("tls handshake")
+    connector
+        .connect(server_name, tcp)
+        .await
+        .expect("tls handshake")
 }
 
 /// A live, admitted control session: completes the WS upgrade + Hello/Welcome so

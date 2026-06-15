@@ -336,7 +336,13 @@ async fn route(
         if crate::admin_http::is_admin_request(&ctx, &req) {
             return Ok(crate::admin_http::handle(ctx, req).await);
         }
-        return Ok(handle_control_upgrade(&mut req, ctx, peer, cancel, permit_cell));
+        return Ok(handle_control_upgrade(
+            &mut req,
+            ctx,
+            peer,
+            cancel,
+            permit_cell,
+        ));
     }
 
     if host.as_deref() == Some(config.apex()) {

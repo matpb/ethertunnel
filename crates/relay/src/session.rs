@@ -110,9 +110,7 @@ impl SessionCtx {
             entitlements: arc_swap::ArcSwapOption::empty(),
             provision: arc_swap::ArcSwapOption::empty(),
             session_limiter: arc_swap::ArcSwapOption::empty(),
-            token_revalidate_interval: AtomicU64::new(
-                TOKEN_REVALIDATE_INTERVAL.as_millis() as u64,
-            ),
+            token_revalidate_interval: AtomicU64::new(TOKEN_REVALIDATE_INTERVAL.as_millis() as u64),
             next_session_id: AtomicU64::new(1),
         })
     }
@@ -869,9 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn claim_exceeding_cap_is_denied_and_label_not_registered() {
-        use crate::entitlement::{
-            Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy,
-        };
+        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
         let (ctx, router, auth, _uid) = fixture();
 
         // Install a gate capping "mat" at 1 concurrent tunnel.
@@ -1085,7 +1081,10 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
         assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
 
         // Spawn a daemon that heartbeats every 5s FOREVER. Each Ping is a read on
@@ -1167,7 +1166,10 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
 
         // Heartbeat across several revalidation intervals; the session must stay
         // up and the route must remain. (Each Ping resets the dead-man too.)

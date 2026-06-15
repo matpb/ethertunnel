@@ -215,8 +215,7 @@ fn err(code: &str) -> serde_json::Value {
 }
 
 fn json<T: Serialize>(status: StatusCode, body: &T) -> Resp {
-    let bytes =
-        serde_json::to_vec(body).unwrap_or_else(|_| br#"{"error":"serialize"}"#.to_vec());
+    let bytes = serde_json::to_vec(body).unwrap_or_else(|_| br#"{"error":"serialize"}"#.to_vec());
     proxy::page(status, "application/json", bytes)
 }
 
@@ -272,15 +271,27 @@ mod tests {
         // Provision mints a token and creates the user.
         let resp = handle_provision(&st, br#"{"external_ref":"acct_test1"}"#);
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(st.registry.list_users().unwrap().iter().any(|(_, n, _)| n == "acct_test1"));
+        assert!(st
+            .registry
+            .list_users()
+            .unwrap()
+            .iter()
+            .any(|(_, n, _)| n == "acct_test1"));
 
         // Claim a label so release has something to return.
         let uid = st.registry.list_users().unwrap()[0].0;
         st.registry.claim_label(uid, "demo").unwrap();
 
-        let resp = handle_release(&st, br#"{"external_ref":"acct_test1","release_ports":true}"#);
+        let resp = handle_release(
+            &st,
+            br#"{"external_ref":"acct_test1","release_ports":true}"#,
+        );
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(st.registry.list_hostnames(Some("acct_test1")).unwrap().is_empty());
+        assert!(st
+            .registry
+            .list_hostnames(Some("acct_test1"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

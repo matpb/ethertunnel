@@ -260,7 +260,9 @@ mod tests {
             sessions.try_admit(a2).is_none(),
             "per-key session cap should block a's 2nd"
         );
-        let _pb = sessions.try_admit(b).expect("session from b fills global cap (2)");
+        let _pb = sessions
+            .try_admit(b)
+            .expect("session from b fills global cap (2)");
         // Global cap (2) reached.
         assert!(
             sessions.try_admit(b).is_none(),

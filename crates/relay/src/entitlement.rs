@@ -629,8 +629,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("etun-test-keygate-{}-{n}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("etun-test-keygate-{}-{n}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let cache = EntitlementCache::open(&path).unwrap();

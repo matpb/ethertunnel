@@ -51,7 +51,10 @@ impl ProvisionConfig {
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.token_file.display()))?;
         let token = raw.trim().to_owned();
         if token.is_empty() {
-            anyhow::bail!("provision token file {} is empty", self.token_file.display());
+            anyhow::bail!(
+                "provision token file {} is empty",
+                self.token_file.display()
+            );
         }
         Ok(token)
     }
