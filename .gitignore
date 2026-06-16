@@ -4,6 +4,10 @@ Cargo.lock.bak
 
 # Local dev artifacts
 MONETIZATION_DEV_STATUS.md
+# Agent/dev notes — local reminder only, never publish to the public repo
+CLAUDE.md
+# Release build output (binaries assembled by the Makefile)
+/dist/
 # Internal security audits + scratch workflow/PoC scripts — never publish
 SECURITY_AUDIT_*
 *.workflow.js

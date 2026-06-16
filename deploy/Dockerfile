@@ -26,6 +26,14 @@ RUN cargo build --release -p ethertunnel \
 RUN printf 'nonroot:x:65532:65532:nonroot:/nonexistent:/sbin/nologin\n' > /etc/passwd.nonroot \
     && printf 'nonroot:x:65532:\n' > /etc/group.nonroot
 
+# Export stage: just the stripped static binary, for release packaging via
+# `docker buildx build --target export -o type=local,dest=<dir>`. Placed before
+# the runtime stage so the default (untargeted) build still produces the relay
+# image. The binary is native-musl for whatever --platform buildx targets, so
+# the same Dockerfile yields both linux/amd64 and linux/arm64 release artifacts.
+FROM scratch AS export
+COPY --from=build /src/target/release/etun /etun
+
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /etc/passwd.nonroot /etc/passwd
