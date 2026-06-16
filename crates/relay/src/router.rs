@@ -324,7 +324,9 @@ mod tests {
         assert!(r.lookup_tcp(20000).is_some());
 
         // Evicting a non-routed resource is a silent no-op.
-        assert!(r.evict_routes(&["ghost.example.com".into()], &[30000]).is_empty());
+        assert!(r
+            .evict_routes(&["ghost.example.com".into()], &[30000])
+            .is_empty());
 
         // The evicted host/port are gone from the session's reverse index, so a
         // later teardown of the session does not double-remove them (no panic).

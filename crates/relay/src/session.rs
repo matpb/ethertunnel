@@ -482,10 +482,25 @@ async fn control_task(
                 handle_release(ctx, &user, hostnames, tcp_ports, &ctrl_tx).await;
             }
             ControlFrame::ListOwned => {
+                // Report the cap the relay already enforces (advisory only). No
+                // entitlement gate (self-host / no licensing) => no cap. An
+                // uncapped/`Allow` plan also reports `None`; a suspended/cancelled
+                // account reports `Some(0)`.
+                let max_tunnels = ctx.entitlements.load_full().and_then(|gate| {
+                    use crate::entitlement::{now_unix, CapDecision};
+                    match gate.cap_for(&user.name, now_unix()) {
+                        CapDecision::Allow => None,
+                        // Clamp like reconcile_cap does: never hand the client a
+                        // negative cap (it would wrap when compared as usize).
+                        CapDecision::Cap(m) => Some(m.max(0)),
+                        CapDecision::DenyAll => Some(0),
+                    }
+                });
                 let _ = ctrl_tx
                     .send(ControlFrame::Owned {
                         hostnames: ctx.auth.owned_hostnames(user.user_id),
                         tcp_ports: ctx.auth.owned_ports(user.user_id),
+                        max_tunnels,
                     })
                     .await;
             }
@@ -991,7 +1006,10 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
         assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
 
         // ListOwned → both the hostname and the granted port.
@@ -1000,9 +1018,12 @@ mod tests {
             ControlFrame::Owned {
                 hostnames,
                 tcp_ports,
+                max_tunnels,
             } => {
                 assert_eq!(hostnames, vec!["myapp.ethertunnel.com".to_string()]);
                 assert_eq!(tcp_ports, vec![20000]);
+                // No entitlement gate installed in the fixture → no cap reported.
+                assert_eq!(max_tunnels, None);
             }
             other => panic!("expected Owned, got {other:?}"),
         }
@@ -1038,9 +1059,88 @@ mod tests {
             ControlFrame::Owned {
                 hostnames,
                 tcp_ports,
+                ..
             } => {
                 assert!(hostnames.is_empty());
                 assert_eq!(tcp_ports, vec![20000]);
+            }
+            other => panic!("expected Owned, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_owned_reports_plan_cap_when_gated() {
+        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        let (ctx, _router, _auth, _uid) = fixture(); // user name "mat"
+        let cache = EntitlementCache::open_in_memory().unwrap();
+        cache
+            .upsert(&Entitlement {
+                external_ref: "mat".into(),
+                customer_id: 1,
+                max_tunnels: Some(3),
+                status: "active".into(),
+                issued_at: 0,
+                expires_at: i64::MAX,
+                updated_at: 0,
+            })
+            .unwrap();
+        ctx.set_entitlements(Arc::new(EntitlementGate::new(
+            cache,
+            KeygatePolicy {
+                product: "ethertunnel".into(),
+                public_key_b64: String::new(),
+                key_id: "k1".into(),
+                staleness_ceiling_secs: 0,
+                require_entitlement: false,
+            },
+        )));
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(&mut ctrl, ControlFrame::ListOwned).await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Owned { max_tunnels, .. } => {
+                assert_eq!(max_tunnels, Some(3), "gated session must report its cap");
+            }
+            other => panic!("expected Owned, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_owned_reports_suspended_as_some_zero() {
+        // A suspended/cancelled account (cap_for -> DenyAll) must report Some(0)
+        // so the client shows the "subscription inactive" advisory, not a cap.
+        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        let (ctx, _router, _auth, _uid) = fixture();
+        let cache = EntitlementCache::open_in_memory().unwrap();
+        cache
+            .upsert(&Entitlement {
+                external_ref: "mat".into(),
+                customer_id: 1,
+                max_tunnels: Some(10),
+                status: "suspended".into(),
+                issued_at: 0,
+                expires_at: i64::MAX,
+                updated_at: 0,
+            })
+            .unwrap();
+        ctx.set_entitlements(Arc::new(EntitlementGate::new(
+            cache,
+            KeygatePolicy {
+                product: "ethertunnel".into(),
+                public_key_b64: String::new(),
+                key_id: "k1".into(),
+                staleness_ceiling_secs: 0,
+                require_entitlement: false,
+            },
+        )));
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(&mut ctrl, ControlFrame::ListOwned).await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Owned { max_tunnels, .. } => {
+                assert_eq!(max_tunnels, Some(0), "suspended account must report cap 0");
             }
             other => panic!("expected Owned, got {other:?}"),
         }
@@ -1382,7 +1482,10 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
         assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
 
         // Heartbeat forever so the dead-man stays reset; only the entitlement gate

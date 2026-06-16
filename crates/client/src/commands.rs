@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{FileConfig, Protocol, TunnelConfig};
-use crate::control::{self, OwnedSet};
+use crate::control::{self, Freed, OwnedSet};
 use crate::status::StatusSnapshot;
 use crate::supervisor::{run_supervisor, ConnState, DaemonStatus};
 use crate::tls::TrustMode;
@@ -71,8 +71,10 @@ pub async fn login(relay: Option<String>, token_stdin: bool) -> anyhow::Result<(
     Ok(())
 }
 
-/// `etun add` — append (or replace) a tunnel in the config.
-pub fn add(
+/// `etun add` — append (or replace) a tunnel in the config, then (best-effort)
+/// show where it leaves you against your plan so a cap surprise shows up here
+/// rather than at `etun up`.
+pub async fn add(
     name: String,
     port: u16,
     hostname: Option<String>,
@@ -98,6 +100,7 @@ pub fn add(
     cfg.tunnels.push(tunnel);
     cfg.save()?;
     println!("added tunnel `{name}` -> {local_host}:{port}");
+    advise_plan(&cfg).await;
     Ok(())
 }
 
@@ -113,8 +116,53 @@ fn relay_creds(cfg: &FileConfig) -> anyhow::Result<(String, String, TrustMode)> 
     Ok((cfg.relay.clone(), token, trust))
 }
 
+/// One-line plan summary for an owned set, or `None` when no cap applies
+/// (self-hosted / uncapped → there is nothing to say). `Some(0)` means the
+/// subscription is inactive.
+fn plan_line(owned: &OwnedSet) -> Option<String> {
+    match owned.max_tunnels {
+        None => None,
+        Some(0) => Some(
+            "Plan: your subscription does not permit active tunnels. \
+             `etun up` will be rejected until you resubscribe."
+                .to_owned(),
+        ),
+        Some(cap) => {
+            let used = owned.used();
+            if used >= cap as usize {
+                Some(format!(
+                    "Plan: {used}/{cap} tunnels used — at your limit. `etun up` will reject \
+                     new tunnels until you upgrade or `etun release` one."
+                ))
+            } else {
+                Some(format!("Plan: {used}/{cap} tunnels used."))
+            }
+        }
+    }
+}
+
+/// Best-effort plan advisory printed after a local config change. Silent when
+/// not logged in, the relay is unreachable, or no cap applies (self-hosted) —
+/// it never blocks the local edit and never contacts the licensing service.
+async fn advise_plan(cfg: &FileConfig) {
+    let Ok((relay, token, trust)) = relay_creds(cfg) else {
+        return;
+    };
+    // Keep `etun add` snappy: the advisory is cosmetic, so cap it tighter than
+    // the connect deadline inside control::open and degrade silently on timeout.
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control::list_owned(&relay, &token, &trust),
+    );
+    if let Ok(Ok(owned)) = fetch.await {
+        if let Some(line) = plan_line(&owned) {
+            println!("{line}");
+        }
+    }
+}
+
 /// Print what a `Release` actually freed on the relay.
-fn report_released(freed: &OwnedSet) {
+fn report_released(freed: &Freed) {
     if freed.hostnames.is_empty() && freed.tcp_ports.is_empty() {
         println!("relay: nothing to release (the relay did not have you owning it)");
         return;
@@ -192,11 +240,18 @@ fn print_remote_reconcile(cfg: &FileConfig, owned: &OwnedSet) {
     let local_ports: HashSet<u16> = cfg
         .tunnels
         .iter()
-        .filter_map(|t| (matches!(t.protocol, Protocol::Tcp)).then_some(t.public_port).flatten())
+        .filter_map(|t| {
+            (matches!(t.protocol, Protocol::Tcp))
+                .then_some(t.public_port)
+                .flatten()
+        })
         .collect();
 
+    if let Some(line) = plan_line(owned) {
+        println!("\n{line}");
+    }
     if owned.hostnames.is_empty() && owned.tcp_ports.is_empty() {
-        println!("\nRelay owns nothing for this account.");
+        println!("Relay owns nothing for this account.");
         return;
     }
     println!("\nRelay-owned (authoritative):");
@@ -444,5 +499,38 @@ mod tests {
         assert_eq!(resolve_relay(None, "cfg.example"), "cfg.example");
         // Nothing set falls back to the hosted default.
         assert_eq!(resolve_relay(None, ""), DEFAULT_RELAY);
+    }
+
+    fn owned(hosts: &[&str], ports: &[u16], max: Option<i64>) -> OwnedSet {
+        OwnedSet {
+            hostnames: hosts.iter().map(|s| s.to_string()).collect(),
+            tcp_ports: ports.to_vec(),
+            max_tunnels: max,
+        }
+    }
+
+    #[test]
+    fn plan_line_branches() {
+        // Self-hosted / uncapped → no plan line at all.
+        assert!(plan_line(&owned(&["a.x"], &[], None)).is_none());
+
+        // Suspended / cancelled (cap 0) → inactive message regardless of usage.
+        let s = plan_line(&owned(&[], &[], Some(0))).unwrap();
+        assert!(s.contains("does not permit"), "got: {s}");
+
+        // Under cap → plain "used/cap" with no upgrade nag.
+        let s = plan_line(&owned(&["a.x", "b.x"], &[], Some(3))).unwrap();
+        assert!(s.contains("2/3"), "got: {s}");
+        assert!(!s.contains("upgrade"), "under-cap must not nag: {s}");
+
+        // At cap → upgrade/release nag. Hostnames AND ports both count.
+        let s = plan_line(&owned(&["a.x", "b.x"], &[20000], Some(3))).unwrap();
+        assert!(s.contains("3/3"), "got: {s}");
+        assert!(s.contains("at your limit"), "got: {s}");
+
+        // Over cap (grandfathered downgrade) still reads as at/over limit.
+        let s = plan_line(&owned(&["a.x", "b.x", "c.x", "d.x"], &[], Some(3))).unwrap();
+        assert!(s.contains("4/3"), "got: {s}");
+        assert!(s.contains("at your limit"), "got: {s}");
     }
 }

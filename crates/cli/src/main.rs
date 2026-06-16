@@ -263,7 +263,12 @@ fn main() -> anyhow::Result<()> {
             hostname,
             tcp,
             local_host,
-        } => ethertunnel_client::commands::add(name, port, hostname, tcp, local_host),
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::add(
+                name, port, hostname, tcp, local_host,
+            ))
+        }
         Command::List { json } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ethertunnel_client::commands::list(json))

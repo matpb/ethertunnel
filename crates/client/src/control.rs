@@ -7,9 +7,12 @@
 //! so the owned-set reconcile (`ListOwned`) and server-side release (`Release`)
 //! can reuse the same plumbing.
 //!
-//! All of these frames are protocol v2; against an older relay the negotiated
-//! `proto` comes back `< 2` and we fail with a clear "relay too old" message
-//! instead of sending a frame the relay cannot decode.
+//! These owned-set frames were introduced at protocol v2; the `Owned` reply
+//! gained its `max_tunnels` field at v3, which changed its wire shape. Because
+//! postcard is not self-describing, a relay that predates the field would
+//! encode `Owned` with one fewer field and we'd mis-decode it — so the client
+//! requires the relay to negotiate v3+ before using this path, and otherwise
+//! fails with a clear "relay too old" message rather than decoding garbage.
 
 use std::time::Duration;
 
@@ -26,8 +29,10 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 use crate::tls::{client_config, TrustMode};
 
-/// Lowest protocol version that understands the owned-set control frames.
-const PROTO_OWNED_SET: u16 = 2;
+/// Lowest protocol version whose `Owned` reply carries `max_tunnels`. The
+/// owned-set frames first appeared at v2, but the `Owned` wire shape changed at
+/// v3, so the client gates on v3 to avoid mis-decoding an older relay's reply.
+const PROTO_OWNED_SET: u16 = 3;
 
 fn connect_host(relay: &str) -> String {
     format!("connect.{relay}")
@@ -76,15 +81,28 @@ async fn tls_connect(
 /// handshake. The returned session is ready for request frames.
 async fn open(relay: &str, token: &str, trust: &TrustMode) -> anyhow::Result<ControlSession> {
     let host = connect_host(relay);
-    let tls = tls_connect(relay, trust).await?;
-    let url = format!("wss://{host}/connect");
-    let mux = mux_io_client(tls, &url)
-        .await
-        .map_err(|e| anyhow::anyhow!("websocket handshake: {e}"))?;
-    let mut conn = mux_connection(mux, yamux::Mode::Client);
-    let control = poll_fn(|cx| conn.poll_new_outbound(cx))
-        .await
-        .map_err(|e| anyhow::anyhow!("opening control stream: {e}"))?;
+    // Bound the whole connect phase (DNS + TCP + TLS + WebSocket + stream open).
+    // None of those awaits carry their own deadline, so a blackholed relay would
+    // otherwise hang the calling command for the kernel SYN timeout (minutes).
+    // This keeps every one-shot control request — including the best-effort
+    // `etun add` advisory — fast-failing instead of stalling the terminal.
+    let (mut conn, control) = match tokio::time::timeout(Duration::from_secs(10), async {
+        let tls = tls_connect(relay, trust).await?;
+        let url = format!("wss://{host}/connect");
+        let mux = mux_io_client(tls, &url)
+            .await
+            .map_err(|e| anyhow::anyhow!("websocket handshake: {e}"))?;
+        let mut conn = mux_connection(mux, yamux::Mode::Client);
+        let control = poll_fn(|cx| conn.poll_new_outbound(cx))
+            .await
+            .map_err(|e| anyhow::anyhow!("opening control stream: {e}"))?;
+        Ok::<_, anyhow::Error>((conn, control))
+    })
+    .await
+    {
+        Err(_) => bail!("timed out connecting to connect.{relay} (10s)"),
+        Ok(r) => r?,
+    };
     let driver = tokio::spawn(async move {
         while let Some(Ok(_)) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {}
     });
@@ -143,28 +161,52 @@ async fn read_reply(ctrl: &mut Compat<yamux::Stream>) -> anyhow::Result<ControlF
     }
 }
 
-/// The relay's authoritative owned set for the authenticated account.
+/// The relay's authoritative owned set for the authenticated account, plus the
+/// plan cap it enforces (`max_tunnels`: `Some(n)` cap, `0` = suspended; `None` =
+/// uncapped / self-hosted). Advisory — the relay is still the enforcement point.
 pub struct OwnedSet {
+    pub hostnames: Vec<String>,
+    pub tcp_ports: Vec<u16>,
+    pub max_tunnels: Option<i64>,
+}
+
+impl OwnedSet {
+    /// How many resources count against the plan cap right now.
+    pub fn used(&self) -> usize {
+        self.hostnames.len() + self.tcp_ports.len()
+    }
+}
+
+/// What a `Release` actually freed (only resources the caller owned).
+pub struct Freed {
     pub hostnames: Vec<String>,
     pub tcp_ports: Vec<u16>,
 }
 
-/// Fetch the caller's owned hostnames + ports from the relay (`ListOwned`).
+/// Fetch the caller's owned hostnames + ports + plan cap from the relay
+/// (`ListOwned`).
 pub async fn list_owned(relay: &str, token: &str, trust: &TrustMode) -> anyhow::Result<OwnedSet> {
     let mut session = open(relay, token, trust).await?;
     if session.proto < PROTO_OWNED_SET {
         session.close().await;
         bail!("relay is too old to report owned tunnels (needs protocol v{PROTO_OWNED_SET}+)");
     }
-    codec::write_frame(&mut session.ctrl, &ControlFrame::ListOwned, MAX_CONTROL_FRAME).await?;
+    codec::write_frame(
+        &mut session.ctrl,
+        &ControlFrame::ListOwned,
+        MAX_CONTROL_FRAME,
+    )
+    .await?;
     let reply = read_reply(&mut session.ctrl).await;
     let out = match reply {
         Ok(ControlFrame::Owned {
             hostnames,
             tcp_ports,
+            max_tunnels,
         }) => Ok(OwnedSet {
             hostnames,
             tcp_ports,
+            max_tunnels,
         }),
         Ok(other) => Err(anyhow::anyhow!("unexpected reply to ListOwned: {other:?}")),
         Err(e) => Err(e),
@@ -181,7 +223,7 @@ pub async fn release(
     trust: &TrustMode,
     hostnames: Vec<String>,
     tcp_ports: Vec<u16>,
-) -> anyhow::Result<OwnedSet> {
+) -> anyhow::Result<Freed> {
     let mut session = open(relay, token, trust).await?;
     if session.proto < PROTO_OWNED_SET {
         session.close().await;
@@ -201,7 +243,7 @@ pub async fn release(
         Ok(ControlFrame::Released {
             hostnames,
             tcp_ports,
-        }) => Ok(OwnedSet {
+        }) => Ok(Freed {
             hostnames,
             tcp_ports,
         }),

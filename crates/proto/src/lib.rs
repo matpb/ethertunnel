@@ -17,7 +17,7 @@ pub mod transport;
 /// The bootstrap frame set (Hello/Welcome/Denied) is frozen forever; within a
 /// version, enum variants are append-only. Anything else bumps this number and
 /// is negotiated in the Hello/Welcome exchange.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Magic bytes that prefix the control stream: ASCII `"ETUN"`.
 pub const CONTROL_MAGIC: [u8; 4] = *b"ETUN";

@@ -139,10 +139,19 @@ pub enum ControlFrame {
     /// the client can reconcile its local config against what the relay actually
     /// holds (surface orphans, self-heal after a plan downgrade pruned a tunnel).
     ListOwned,
-    /// Relay → daemon. The caller's currently-owned hostnames + TCP ports.
+    /// Relay → daemon. The caller's currently-owned hostnames + TCP ports, plus
+    /// the plan cap the relay enforces against them so the client can give an
+    /// early, advisory heads-up before `etun up` would be rejected.
+    ///
+    /// `max_tunnels`: `Some(n)` = at most n concurrently-owned resources (`0` =
+    /// suspended/cancelled — no new tunnels); `None` = no cap applies
+    /// (self-hosted, or a relay with no entitlement gate / an uncapped plan).
+    /// It is purely advisory: the relay remains the authoritative enforcement
+    /// point at claim time. The client never contacts the licensing service.
     Owned {
         hostnames: Vec<String>,
         tcp_ports: Vec<u16>,
+        max_tunnels: Option<i64>,
     },
 }
 
@@ -203,6 +212,12 @@ mod tests {
             ControlFrame::Owned {
                 hostnames: vec!["a.ethertunnel.com".into()],
                 tcp_ports: vec![20001],
+                max_tunnels: Some(3),
+            },
+            ControlFrame::Owned {
+                hostnames: vec![],
+                tcp_ports: vec![],
+                max_tunnels: None,
             },
         ] {
             let bytes = postcard::to_allocvec(&f).unwrap();

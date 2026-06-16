@@ -332,7 +332,12 @@ impl Registry {
         let token = generate_token();
         conn.execute(
             "INSERT INTO tokens (user_id, token_hash, label, created_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![id, hash_token(&token), Some("self-serve-recovery"), Self::now()],
+            rusqlite::params![
+                id,
+                hash_token(&token),
+                Some("self-serve-recovery"),
+                Self::now()
+            ],
         )?;
         Ok((token, revoked))
     }
@@ -397,9 +402,8 @@ impl Registry {
     /// against the relay's authoritative ownership.
     pub fn owned_hostnames(&self, user_id: i64) -> Result<Vec<String>, RegistryError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT label FROM hostnames WHERE user_id = ?1 ORDER BY created_at, id",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT label FROM hostnames WHERE user_id = ?1 ORDER BY created_at, id")?;
         let rows = stmt
             .query_map([user_id], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<String>, _>>()?;
@@ -425,11 +429,7 @@ impl Registry {
     /// anyone. Returns true iff a row was removed. The `user_id` guard is what
     /// makes this safe to expose to an authenticated, non-admin daemon: a user
     /// can only ever release their own labels.
-    pub fn release_hostname_owned(
-        &self,
-        user_id: i64,
-        fqdn: &str,
-    ) -> Result<bool, RegistryError> {
+    pub fn release_hostname_owned(&self, user_id: i64, fqdn: &str) -> Result<bool, RegistryError> {
         let Some(label) = self.label_of(fqdn) else {
             return Ok(false);
         };
@@ -563,7 +563,11 @@ impl Registry {
             let mut stmt =
                 conn.prepare("SELECT created_at, id, label FROM hostnames WHERE user_id = ?1")?;
             let rows = stmt.query_map([user_id], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, Owned::Host(r.get(2)?)))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    Owned::Host(r.get(2)?),
+                ))
             })?;
             for row in rows {
                 owned.push(row?);
