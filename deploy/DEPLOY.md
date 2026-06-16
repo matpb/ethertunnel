@@ -19,6 +19,33 @@ Point the apex, the wildcard, and the control endpoint at the VPS, **DNS-only**
     A   *.ethertunnel.com         -> <VPS_IP>   (DNS only)
     A   connect.ethertunnel.com   -> <VPS_IP>   (DNS only)
 
+## Firewall / raw-TCP
+
+The relay needs different inbound ports open depending on the tunnel type:
+
+- **HTTPS tunnels** (`<label>.<domain>`) and the daemon control channel
+  (`connect.<domain>`) ride **`:443` only** — open that one port inbound and
+  HTTPS tunnels work.
+- **Raw-TCP tunnels** (`etun ... --tcp`) are served on the relay's
+  `[tcp].port_range` (default **20000–20999**). That entire range must be open
+  **inbound** or raw-TCP tunnels fail *silently*: the control channel still
+  connects over `:443`, the daemon reports the tunnel as up, but visitor
+  connections to the public port never reach the relay.
+
+Open `:443` plus the raw-TCP range on the host firewall — for `ufw`:
+
+    ufw allow 443/tcp
+    ufw allow 20000:20999/tcp   # only if you offer raw-TCP tunnels
+
+**Mirror the same rules in your cloud provider's security group / network
+firewall** (DigitalOcean Cloud Firewall, AWS security group, GCP firewall rule,
+Hetzner firewall, …). A host-level `ufw allow` is not enough when the cloud
+network layer also filters inbound traffic — both must permit the range.
+
+If you change `[tcp].port_range` in `relay.toml`, open the *new* range to match.
+Self-host relays that only ever serve HTTPS tunnels can leave the raw-TCP range
+closed.
+
 ## 2. Binary + user
 
     # build a static musl binary (locally, via Docker) and copy it up:

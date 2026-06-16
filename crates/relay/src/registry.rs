@@ -196,6 +196,16 @@ impl Registry {
             .unwrap_or(0)
     }
 
+    /// Resolve a user name (the keygate `external_ref`) to its registry user id,
+    /// or `Ok(None)` if no such user exists. Used by the entitlement reconcile
+    /// path, which is keyed by `external_ref` but prunes by `user_id`.
+    pub fn lookup_user_id(&self, name: &str) -> Result<Option<i64>, RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
+            .optional()
+            .map_err(RegistryError::Db)
+    }
+
     fn user_id(conn: &Connection, name: &str) -> Result<i64, RegistryError> {
         conn.query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
             .optional()?
@@ -461,6 +471,78 @@ impl Registry {
             }
             Err(e) => Err(RegistryError::Db(e)),
         }
+    }
+
+    /// Prune `user_id`'s owned resources down to `cap`, deleting the excess
+    /// **deterministically**: the policy is grandfather-oldest — keep the oldest
+    /// `cap` resources (by `created_at`, ties broken by the stable rowid/port key)
+    /// and drop the newest over the cap. Hostnames and ports are pooled into one
+    /// owned set and ordered together, so the newest acquisitions go first
+    /// regardless of kind (matching the [`CapDecision`](crate::entitlement::CapDecision)
+    /// "grandfather oldest-N, prune newest over cap" semantics).
+    ///
+    /// Runs under the connection mutex so the count-then-delete is atomic against
+    /// any concurrent claim. Returns the labels and ports that were removed (so
+    /// the caller can tear down the corresponding live routes). A `cap < 0` is
+    /// clamped to 0 (deny-all → prune everything); `cap >= owned` is a no-op.
+    pub fn prune_owned_to_cap(
+        &self,
+        user_id: i64,
+        cap: i64,
+    ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
+        let cap = cap.max(0);
+        let conn = self.conn.lock().unwrap();
+        // Build the unified owned set, oldest first. `kind` (0 = host, 1 = port)
+        // only breaks created_at ties deterministically; it is not a priority.
+        #[derive(Debug)]
+        enum Owned {
+            Host(String),
+            Port(u16),
+        }
+        let mut owned: Vec<(i64, i64, Owned)> = Vec::new(); // (created_at, key, res)
+        {
+            let mut stmt =
+                conn.prepare("SELECT created_at, id, label FROM hostnames WHERE user_id = ?1")?;
+            let rows = stmt.query_map([user_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, Owned::Host(r.get(2)?)))
+            })?;
+            for row in rows {
+                owned.push(row?);
+            }
+        }
+        {
+            let mut stmt =
+                conn.prepare("SELECT created_at, port FROM tcp_ports WHERE user_id = ?1")?;
+            let rows = stmt.query_map([user_id], |r| {
+                let port = r.get::<_, i64>(1)? as u16;
+                Ok((r.get::<_, i64>(0)?, port as i64, Owned::Port(port)))
+            })?;
+            for row in rows {
+                owned.push(row?);
+            }
+        }
+        // Oldest first: created_at asc, then the stable key asc. Everything at
+        // index >= cap is "newest over cap" and gets pruned.
+        owned.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let cap = cap as usize;
+        if owned.len() <= cap {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut removed_hosts = Vec::new();
+        let mut removed_ports = Vec::new();
+        for (_, _, res) in owned.into_iter().skip(cap) {
+            match res {
+                Owned::Host(label) => {
+                    conn.execute("DELETE FROM hostnames WHERE label = ?1", [&label])?;
+                    removed_hosts.push(label);
+                }
+                Owned::Port(port) => {
+                    conn.execute("DELETE FROM tcp_ports WHERE port = ?1", [port as i64])?;
+                    removed_ports.push(port);
+                }
+            }
+        }
+        Ok((removed_hosts, removed_ports))
     }
 
     /// Create a token for a user, returning the plaintext (shown once).
@@ -927,6 +1009,63 @@ mod tests {
         r.add_hostname("alpha", "acct_mat").unwrap();
         r.add_port(20002, "acct_mat").unwrap();
         assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
+    }
+
+    /// P1-D: prune_owned_to_cap keeps the OLDEST `cap` owned resources (by
+    /// created_at) and deletes the newest over the cap, returning what it removed.
+    /// We force distinct created_at values by writing them directly so ordering is
+    /// deterministic regardless of wall-clock granularity.
+    #[test]
+    fn prune_owned_to_cap_keeps_oldest_drops_newest() {
+        let r = reg();
+        let mat = r.add_user("mat").unwrap();
+        // Three hostnames + one port with explicit, increasing created_at.
+        {
+            let conn = r.conn.lock().unwrap();
+            for (label, ts) in [("oldest", 100), ("middle", 200), ("newest", 300)] {
+                conn.execute(
+                    "INSERT INTO hostnames (user_id, label, created_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![mat, label, ts],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO tcp_ports (port, user_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![20500i64, mat, 250i64],
+            )
+            .unwrap();
+        }
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 4);
+
+        // Cap to 2: keep the two oldest (oldest@100, middle@200); drop port@250
+        // and newest@300.
+        let (hosts, ports) = r.prune_owned_to_cap(mat, 2).unwrap();
+        let mut removed = hosts.clone();
+        removed.sort();
+        assert_eq!(removed, vec!["newest".to_string()]);
+        assert_eq!(ports, vec![20500]);
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
+        assert!(r.owns_hostname(mat, "oldest.ethertunnel.com"));
+        assert!(r.owns_hostname(mat, "middle.ethertunnel.com"));
+        assert!(!r.owns_hostname(mat, "newest.ethertunnel.com"));
+        assert!(!r.owns_port(mat, 20500));
+
+        // Already within cap => no-op.
+        let (h2, p2) = r.prune_owned_to_cap(mat, 5).unwrap();
+        assert!(h2.is_empty() && p2.is_empty());
+
+        // Cap 0 (deny-all) prunes everything remaining.
+        let (h3, p3) = r.prune_owned_to_cap(mat, 0).unwrap();
+        assert_eq!(h3.len() + p3.len(), 2);
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 0);
+    }
+
+    #[test]
+    fn lookup_user_id_resolves_or_none() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+        assert_eq!(r.lookup_user_id("acct_mat").unwrap(), Some(mat));
+        assert_eq!(r.lookup_user_id("ghost").unwrap(), None);
     }
 
     #[test]

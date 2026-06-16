@@ -42,4 +42,35 @@ db_path = "/var/lib/ethertunnel/registry.db"
 
 [tcp]
 # Inclusive public-port range daemons may reserve for raw-TCP tunnels.
+# IMPORTANT: this entire range must be opened INBOUND on the host firewall AND
+# the cloud security group, or --tcp tunnels fail silently (HTTPS tunnels need
+# only :443). See the "Firewall / raw-TCP" section in deploy/DEPLOY.md for the
+# exact `ufw allow 20000:20999/tcp` and cloud-console steps.
 port_range = [20000, 20999]
+
+# keygate licensing / entitlement enforcement. OMIT this whole section for a
+# self-host relay: with no [keygate] block the relay does not enforce any cap and
+# every account is allowed (fail-open) — the correct default for self-host.
+#
+# Hosted / commercial relays MUST include this section AND set
+# require_entitlement = true. With it true, a user with no fresh, signed
+# entitlement is denied (fail-closed); leaving it false (the built-in default)
+# means a relay that loses contact with keygate keeps serving cancelled accounts.
+# [keygate]
+# base_url = "https://license.ethertunnel.com"
+# # File holding the consumer bearer token keygate issued this relay (0600).
+# consumer_token_file = "/etc/ethertunnel/keygate.token"
+# # keygate's pinned Ed25519 public key (base64, standard) used to verify the
+# # signed entitlement envelopes offline.
+# public_key = "BASE64_ED25519_PUBLIC_KEY"
+# # The signing key id this relay accepts (rotation guard).
+# key_id = "kg-2026-06"
+# # Product the entitlements are scoped to.
+# product = "ethertunnel"
+# # How often to pull the entitlement snapshot from keygate (seconds).
+# poll_interval_secs = 60
+# # Honor a cached envelope at most this many seconds past its expires_at.
+# staleness_ceiling_secs = 259200
+# # Hosted/commercial: set TRUE so unentitled users are denied. Self-host leaves
+# # this false (and normally omits the whole [keygate] section).
+# require_entitlement = true

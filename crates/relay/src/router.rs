@@ -179,6 +179,35 @@ impl Router {
         }
     }
 
+    /// Tear down the live routes for the given hostnames (FQDN, lowercase) and
+    /// TCP ports, removing them from the table and from each owning session's
+    /// reverse index. Returns the distinct `(handle, resource)` pairs that were
+    /// actually routed, so the caller can notify each with a `Denied` frame
+    /// *outside* the lock. Routes that aren't currently live are silently
+    /// skipped. Used by the entitlement downgrade-reconcile path to stop traffic
+    /// on tunnels pruned from a user's owned set.
+    pub fn evict_routes(&self, hosts: &[String], ports: &[u16]) -> Vec<(SessionHandle, Resource)> {
+        let mut inner = self.inner.write().unwrap();
+        let mut evicted = Vec::new();
+        for host in hosts {
+            if let Some(handle) = inner.http.remove(host) {
+                if let Some(set) = inner.by_session.get_mut(&handle.session_id) {
+                    set.hosts.remove(host);
+                }
+                evicted.push((handle, Resource::Host(host.clone())));
+            }
+        }
+        for &port in ports {
+            if let Some(handle) = inner.tcp.remove(&port) {
+                if let Some(set) = inner.by_session.get_mut(&handle.session_id) {
+                    set.ports.remove(&port);
+                }
+                evicted.push((handle, Resource::Port(port)));
+            }
+        }
+        evicted
+    }
+
     /// Number of routed hostnames (for diagnostics/tests).
     pub fn hostname_count(&self) -> usize {
         self.inner.read().unwrap().http.len()
@@ -273,6 +302,34 @@ mod tests {
         // The new session disconnecting clears it.
         r.remove_session(2);
         assert!(r.lookup_http("a.example.com").is_none());
+    }
+
+    #[test]
+    fn evict_routes_removes_and_returns_affected() {
+        let r = Router::new();
+        let (h, _rx) = handle(1, 100);
+        r.claim(
+            &h,
+            &["keep.example.com".into(), "drop.example.com".into()],
+            &[20000, 20001],
+        );
+
+        // Evict one host + one port; only those are returned and removed.
+        let evicted = r.evict_routes(&["drop.example.com".into()], &[20001]);
+        assert_eq!(evicted.len(), 2);
+        assert!(r.lookup_http("drop.example.com").is_none());
+        assert!(r.lookup_tcp(20001).is_none());
+        // The kept ones survive.
+        assert!(r.lookup_http("keep.example.com").is_some());
+        assert!(r.lookup_tcp(20000).is_some());
+
+        // Evicting a non-routed resource is a silent no-op.
+        assert!(r.evict_routes(&["ghost.example.com".into()], &[30000]).is_empty());
+
+        // The evicted host/port are gone from the session's reverse index, so a
+        // later teardown of the session does not double-remove them (no panic).
+        r.remove_session(1);
+        assert!(r.lookup_http("keep.example.com").is_none());
     }
 
     #[test]

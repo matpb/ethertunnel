@@ -12,9 +12,19 @@ use crate::config::{Config, TlsMode};
 use crate::dns_cloudflare::Cloudflare;
 use crate::registry::Registry;
 
+/// Severity of one check, for tidy reporting and the pass/fail tally.
+#[derive(PartialEq, Eq)]
+enum Level {
+    Pass,
+    /// Advisory: surfaced but does NOT count as a failure (e.g. something the
+    /// doctor cannot verify from here and the operator must check manually).
+    Warn,
+    Fail,
+}
+
 /// Outcome of one check, for tidy reporting.
 struct Check {
-    ok: bool,
+    level: Level,
     label: String,
     detail: String,
 }
@@ -22,20 +32,36 @@ struct Check {
 impl Check {
     fn pass(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            ok: true,
+            level: Level::Pass,
+            label: label.into(),
+            detail: detail.into(),
+        }
+    }
+    fn warn(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            level: Level::Warn,
             label: label.into(),
             detail: detail.into(),
         }
     }
     fn fail(label: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
-            ok: false,
+            level: Level::Fail,
             label: label.into(),
             detail: detail.into(),
         }
     }
+    /// Only a hard `Fail` counts against the doctor's exit status; warnings are
+    /// advisories the operator must act on but don't fail the pre-flight.
+    fn is_fail(&self) -> bool {
+        self.level == Level::Fail
+    }
     fn print(&self) {
-        let mark = if self.ok { "ok  " } else { "FAIL" };
+        let mark = match self.level {
+            Level::Pass => "ok  ",
+            Level::Warn => "WARN",
+            Level::Fail => "FAIL",
+        };
         println!("[{mark}] {:<22} {}", self.label, self.detail);
     }
 }
@@ -77,6 +103,22 @@ pub async fn run(config: &Config) -> bool {
     // --- TLS material readiness (what would actually be served) ---
     checks.push(tls_check(config));
 
+    // --- raw-TCP reachability (advisory; cannot be verified from here) ---
+    // HTTPS tunnels need only :443 inbound, but raw-TCP tunnels are served on the
+    // configured port range, which must be opened inbound on BOTH the host
+    // firewall and the cloud security group. The doctor has no way to probe its
+    // own external reachability, so this is a WARN the operator must act on, not
+    // a pass/fail. See deploy/DEPLOY.md "Firewall / raw-TCP".
+    let [lo, hi] = config.tcp.port_range;
+    checks.push(Check::warn(
+        "raw-tcp firewall",
+        format!(
+            "raw-TCP tunnels need ports {lo}-{hi}/tcp open INBOUND on the host \
+             firewall + cloud security group (HTTPS tunnels need only :443); \
+             this cannot be verified externally — see DEPLOY.md"
+        ),
+    ));
+
     // --- ACME credentials (only meaningful in acme mode) ---
     if config.tls.mode == TlsMode::Acme {
         match &config.tls.acme {
@@ -108,9 +150,14 @@ pub async fn run(config: &Config) -> bool {
     for c in &checks {
         c.print();
     }
-    let failed = checks.iter().filter(|c| !c.ok).count();
+    let failed = checks.iter().filter(|c| c.is_fail()).count();
+    let warned = checks.iter().filter(|c| c.level == Level::Warn).count();
     if failed == 0 {
-        println!("\nAll checks passed.");
+        if warned > 0 {
+            println!("\nAll critical checks passed ({warned} warning(s) — review above).");
+        } else {
+            println!("\nAll checks passed.");
+        }
         true
     } else {
         println!("\n{failed} check(s) failed.");

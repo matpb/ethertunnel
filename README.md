@@ -181,7 +181,10 @@ run a modified version as a network service, you must offer your users the
 modified source under the same license.
 
 A separate **commercial license** is available from the author for anyone who
-wants to build on EtherTunnel without the AGPL's source-sharing terms — reach out
-at license@ethertunnel.com.
+wants to build on EtherTunnel without the AGPL's source-sharing terms — what it
+covers, what stays free, and how to ask for a quote is in
+[COMMERCIAL.md](COMMERCIAL.md). Short version: unmodified self-hosting needs no
+license; the commercial license is for running a *modified* relay as a service
+or embedding it in a closed product. Reach out at license@ethertunnel.com.
 
 Not affiliated with Cloudflare or ngrok.

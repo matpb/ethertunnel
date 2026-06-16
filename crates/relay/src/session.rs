@@ -405,7 +405,7 @@ async fn control_task(
                     // Re-resolve the token. None (revoked/deleted) or a different
                     // user_id (token reissued to another user) => terminate.
                     match ctx.auth.authenticate(token.expose()) {
-                        Some(u) if u.user_id == user.user_id => continue,
+                        Some(u) if u.user_id == user.user_id => {}
                         _ => {
                             tracing::info!(session_id, "token revoked; closing session");
                             let _ = ctrl_tx
@@ -422,6 +422,36 @@ async fn control_task(
                             return Ok(());
                         }
                     }
+                    // The token still resolves to this user, but the *entitlement*
+                    // may have lapsed (cancelled/suspended) since the session came
+                    // up. The claim-time gate only fires on NEW claims, so a
+                    // cancelled customer keeps serving on already-routed tunnels
+                    // until they disconnect. Consult the gate here on the same
+                    // cadence so cancel/suspend stops LIVE traffic within one
+                    // interval. This reads only the already-synced, signature-
+                    // verified cache (no hot-path keygate call) and respects the
+                    // policy's staleness ceiling / require_entitlement semantics:
+                    // self-host (no gate installed) and unentitled-but-allowed
+                    // users are unaffected (only CapDecision::DenyAll terminates).
+                    if let Some(gate) = ctx.entitlements.load_full() {
+                        use crate::entitlement::{now_unix, CapDecision};
+                        if gate.cap_for(&user.name, now_unix()) == CapDecision::DenyAll {
+                            tracing::info!(
+                                session_id,
+                                user = %user.name,
+                                "entitlement lapsed; closing session"
+                            );
+                            let _ = ctrl_tx
+                                .send(ControlFrame::Denied {
+                                    code: DenyCode::LimitExceeded,
+                                    message: "subscription lapsed or suspended".into(),
+                                })
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            return Ok(());
+                        }
+                    }
+                    continue;
                 }
             }
         };
@@ -1147,6 +1177,101 @@ mod tests {
         );
 
         // The daemon's side observes the stream close shortly after.
+        let _ = tokio::time::timeout(Duration::from_secs(5), heartbeat).await;
+    }
+
+    /// P1-B: a LIVE session whose entitlement lapses (cancel/suspend) must be
+    /// terminated by the in-session revalidation loop within one interval — even
+    /// while the daemon keeps heartbeating (the dead-man can never fire on a
+    /// pinging daemon). The token stays valid the whole time; only the
+    /// entitlement gate flips to DenyAll. We start with an ACTIVE entitlement
+    /// (claim succeeds), then swap in a SUSPENDED gate and assert the route is
+    /// torn down well under the dead-man.
+    #[tokio::test(start_paused = true)]
+    async fn lapsed_entitlement_terminates_live_session() {
+        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        let (ctx, router, _auth, _uid) = fixture();
+        const REVALIDATE_SECS: u64 = 10;
+        ctx.set_token_revalidate_interval_secs(REVALIDATE_SECS);
+
+        // Active entitlement so the initial claim is granted.
+        let install_gate = |status: &str| {
+            let cache = EntitlementCache::open_in_memory().unwrap();
+            cache
+                .upsert(&Entitlement {
+                    external_ref: "mat".into(),
+                    customer_id: 1,
+                    max_tunnels: Some(5),
+                    status: status.into(),
+                    issued_at: 0,
+                    expires_at: i64::MAX,
+                    updated_at: 0,
+                })
+                .unwrap();
+            Arc::new(EntitlementGate::new(
+                cache,
+                KeygatePolicy {
+                    product: "ethertunnel".into(),
+                    public_key_b64: String::new(),
+                    key_id: "k1".into(),
+                    staleness_ceiling_secs: 0,
+                    require_entitlement: false,
+                },
+            ))
+        };
+        ctx.set_entitlements(install_gate("active"));
+
+        let mut ctrl = connect(ctx.clone()).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["myapp.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
+
+        // Heartbeat forever so the dead-man stays reset; only the entitlement gate
+        // can end this session.
+        let heartbeat = tokio::spawn(async move {
+            let mut nonce = 0u64;
+            loop {
+                tokio::select! {
+                    biased;
+                    r = codec::read_frame::<_, ControlFrame>(&mut ctrl, MAX_CONTROL_FRAME) => {
+                        if r.is_err() { break; }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        if codec::write_frame(&mut ctrl, &ControlFrame::Ping { nonce }, MAX_CONTROL_FRAME)
+                            .await.is_err() { break; }
+                        nonce += 1;
+                    }
+                }
+            }
+        });
+
+        // The customer cancels: swap in a SUSPENDED gate (cap_for -> DenyAll).
+        ctx.set_entitlements(install_gate("suspended"));
+
+        // The next revalidation tick must tear the route down, bounded to 40s of
+        // virtual time (>2 intervals, well below the 90s dead-man).
+        let torn_down = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if router.lookup_http("myapp.ethertunnel.com").is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        assert!(
+            torn_down.is_ok(),
+            "a lapsed/suspended entitlement must terminate the live session within \
+             ~2x the revalidate interval (well under the dead-man)"
+        );
         let _ = tokio::time::timeout(Duration::from_secs(5), heartbeat).await;
     }
 

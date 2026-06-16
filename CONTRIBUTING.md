@@ -73,5 +73,44 @@ OS, exact commands, and what you expected vs. what happened). For larger
 features, opening an issue to discuss the approach before writing code saves
 everyone time.
 
-By contributing, you agree your contributions are licensed under the project's
-[LICENSE](LICENSE).
+## Licensing of your contributions
+
+EtherTunnel is dual-licensed: the public project is **AGPL-3.0-or-later**, and a
+separate **commercial license** is offered to parties who can't live with the
+AGPL's network-copyleft terms (see [COMMERCIAL.md](COMMERCIAL.md)). For that
+model to keep working, the maintainer has to be able to ship every line of the
+codebase under *both* licenses — including the lines you contribute. So
+contributions come with two lightweight strings attached.
+
+**1. Inbound = outbound.** Your contributions are licensed to the project and to
+everyone downstream under the same terms as the project itself
+([AGPL-3.0-or-later](LICENSE)). Nothing here takes that away — your code stays
+open source.
+
+**2. Relicensing grant.** In addition, you grant the project maintainer
+(Mathieu-Philippe Bourgeois, and any successor steward of the project) a
+perpetual, irrevocable, worldwide, royalty-free, non-exclusive right to use,
+reproduce, modify, distribute, sublicense, and **relicense** your contributions
+under any terms — including proprietary or commercial terms — alongside the
+AGPL. In plain terms: you keep your copyright, your code stays AGPL for everyone,
+and the maintainer can additionally include it in the commercial-licensed build.
+Without this grant a single external patch would make the commercial license
+impossible to honor, so it's a hard requirement for merging.
+
+**3. You have the right to grant it.** You confirm the contribution is your own
+work (or you're otherwise entitled to submit it under these terms), and that
+you're not knowingly contributing anyone else's copyrighted or patent-encumbered
+material.
+
+### Sign-off (DCO)
+
+We use the [Developer Certificate of Origin](https://developercertificate.org/).
+Certify the above by signing off each commit:
+
+```sh
+git commit -s -m "your message"
+```
+
+That appends a `Signed-off-by: Your Name <you@example.com>` trailer, which
+records that you agree to the terms in this section. Use a real name and a real
+email. That's the whole process — no separate CLA to mail in.

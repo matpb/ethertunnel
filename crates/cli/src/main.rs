@@ -361,23 +361,14 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION").to_owned(),
     );
 
-    // Wire the keygate→relay provisioning control plane when configured. Absent
-    // => the `/admin/*` endpoints are not mounted (no inbound control API).
-    if let Some(pv) = &config.provision {
-        use ethertunnel_relay::admin_http::ProvisionState;
-        let token = pv.token().context("reading provision token")?;
-        ctx.set_provision(Arc::new(ProvisionState {
-            registry: registry.clone(),
-            token,
-        }));
-        tracing::info!("self-serve provisioning control plane enabled on connect host");
-    }
-
-    // Wire keygate entitlement enforcement when configured. Absent => no gate,
-    // so the relay behaves exactly as before (every owned claim allowed).
+    // Wire keygate entitlement enforcement first (so the provisioning control
+    // plane below can hand its gate to the `/admin/entitlements` push receiver).
+    // Absent => no gate, so the relay behaves exactly as before (every owned
+    // claim allowed; self-host fail-open).
+    let mut entitlement_gate = None;
     if let Some(kg) = &config.keygate {
         use ethertunnel_relay::entitlement::{
-            spawn_sync, EntitlementCache, EntitlementGate, KeygateClient, KeygatePolicy,
+            spawn_sync, EntitlementCache, EntitlementGate, KeygateClient, KeygatePolicy, Reconciler,
         };
         let cache_path = config
             .registry
@@ -395,18 +386,54 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
             require_entitlement: kg.require_entitlement,
         };
         let gate = Arc::new(EntitlementGate::new(cache, policy));
+        // Install the downgrade reconciler so a cap drop prunes over-cap tunnels
+        // and tears down their live routes (registry + router + base domain).
+        gate.set_reconciler(Arc::new(Reconciler {
+            registry: registry.clone(),
+            router: ctx.router.clone(),
+            domain: config.server.domain.clone(),
+        }));
         ctx.set_entitlements(gate.clone());
         let client = KeygateClient::new(kg.base_url.clone(), kg.token()?, kg.product.clone());
         spawn_sync(
-            gate,
+            gate.clone(),
             client,
             std::time::Duration::from_secs(kg.poll_interval_secs),
         );
+        // Make the effective entitlement policy auditable at startup, and shout if
+        // enforcement is OFF (fail-open) so a hosted/commercial misconfig is loud.
         tracing::info!(
             base_url = %kg.base_url,
             product = %kg.product,
+            require_entitlement = kg.require_entitlement,
+            staleness_ceiling_secs = kg.staleness_ceiling_secs,
+            poll_interval_secs = kg.poll_interval_secs,
             "keygate entitlement enforcement enabled"
         );
+        if !kg.require_entitlement {
+            tracing::warn!(
+                "entitlement enforcement OFF (fail-open) — set require_entitlement=true for \
+                 hosted/commercial relays"
+            );
+        }
+        entitlement_gate = Some(gate);
+    } else {
+        tracing::info!(
+            "no [keygate] section — entitlement enforcement OFF (self-host / fail-open)"
+        );
+    }
+
+    // Wire the keygate→relay provisioning control plane when configured. Absent
+    // => the `/admin/*` endpoints are not mounted (no inbound control API).
+    if let Some(pv) = &config.provision {
+        use ethertunnel_relay::admin_http::ProvisionState;
+        let token = pv.token().context("reading provision token")?;
+        ctx.set_provision(Arc::new(ProvisionState {
+            registry: registry.clone(),
+            token,
+            entitlements: entitlement_gate.clone(),
+        }));
+        tracing::info!("self-serve provisioning control plane enabled on connect host");
     }
 
     let handle = serve(Arc::new(config), ctx).await?;

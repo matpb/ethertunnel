@@ -129,14 +129,24 @@ pub struct Entitlement {
 }
 
 /// The decision the gate hands the claim path for a given user.
+///
+/// Downgrade policy (enforced by the reconcile path, not just at claim time):
+/// when a customer's cap drops below the resources they already own, the relay
+/// **grandfathers the oldest-N and prunes the newest over the cap** — it keeps
+/// the `cap` oldest owned resources (by `created_at`) and deletes the rest,
+/// tearing down their live routes. `DenyAll` reconciles to a cap of 0 (prune
+/// everything). See [`Registry::prune_owned_to_cap`](crate::registry::Registry::prune_owned_to_cap).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapDecision {
     /// No applicable entitlement (or stale beyond the ceiling, with
     /// `require_entitlement` off) — do not enforce; let the claim through.
     Allow,
-    /// Cap concurrently-active tunnels at this number.
+    /// Cap concurrently-active tunnels at this number. On a downgrade, owned
+    /// resources beyond this are pruned newest-first (oldest-N grandfathered).
     Cap(i64),
     /// Deny all new claims (suspended, or unentitled with `require_entitlement`).
+    /// Reconciles to a cap of 0: every owned resource is pruned and its live
+    /// routes are torn down.
     DenyAll,
 }
 
@@ -216,6 +226,17 @@ impl EntitlementCache {
         Ok(())
     }
 
+    /// Every cached `external_ref`. Used by the periodic reconcile sweep to bring
+    /// continuously-connected daemons into compliance after a cap downgrade.
+    pub fn all_external_refs(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT external_ref FROM entitlements")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get(&self, external_ref: &str) -> Result<Option<Entitlement>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -251,15 +272,132 @@ pub struct KeygatePolicy {
     pub require_entitlement: bool,
 }
 
+/// Actuator the gate uses to enforce a *downgrade* against live state: prune the
+/// registry's owned rows past the new cap and tear down the matching live routes.
+/// Installed once at startup (after the registry/router exist) via
+/// [`EntitlementGate::set_reconciler`]; absent in unit tests, where the gate is
+/// pure cache+policy and reconcile is a no-op.
+pub struct Reconciler {
+    pub registry: std::sync::Arc<crate::registry::Registry>,
+    pub router: std::sync::Arc<crate::router::Router>,
+    /// Base domain, so a pruned label can be composed into the FQDN the router
+    /// keys its HTTP table by.
+    pub domain: String,
+}
+
 /// The claim-time entitlement gate: a cache plus the policy that interprets it.
 pub struct EntitlementGate {
     cache: EntitlementCache,
     policy: KeygatePolicy,
+    /// Set once at startup so cap downgrades prune over-cap tunnels + tear down
+    /// their routes. `None` (unit tests / pre-wiring) => reconcile is a no-op.
+    reconciler: arc_swap::ArcSwapOption<Reconciler>,
 }
 
 impl EntitlementGate {
     pub fn new(cache: EntitlementCache, policy: KeygatePolicy) -> Self {
-        Self { cache, policy }
+        Self {
+            cache,
+            policy,
+            reconciler: arc_swap::ArcSwapOption::empty(),
+        }
+    }
+
+    /// Install the downgrade reconciler (registry + router + domain). Called by
+    /// `run_serve` once those exist. Until installed, an ingested cap downgrade
+    /// updates the cache and bites at the next claim, but does not retroactively
+    /// prune already-owned/routed tunnels.
+    pub fn set_reconciler(&self, r: std::sync::Arc<Reconciler>) {
+        self.reconciler.store(Some(r));
+    }
+
+    /// The effective owned-resource cap for `external_ref` under the current
+    /// cached entitlement + policy. `None` means "no cap applies" (Allow);
+    /// `Some(0)` means deny-all (prune everything). This is the cap the
+    /// downgrade-reconcile path prunes to.
+    fn reconcile_cap(&self, external_ref: &str, now: i64) -> Option<i64> {
+        match self.cap_for(external_ref, now) {
+            CapDecision::Allow => None,
+            CapDecision::Cap(m) => Some(m.max(0)),
+            CapDecision::DenyAll => Some(0),
+        }
+    }
+
+    /// Reconcile one user's live state to their current cap: if they own more
+    /// resources than the cap allows, prune the newest over the cap (oldest-N
+    /// grandfathered) and tear down the corresponding live routes, sending each
+    /// affected session a `Denied{LimitExceeded}`. No-op when no reconciler is
+    /// installed, the user is unknown, or they are already within cap. Returns
+    /// the number of resources pruned.
+    pub fn reconcile_user(&self, external_ref: &str, now: i64) -> usize {
+        let Some(rec) = self.reconciler.load_full() else {
+            return 0;
+        };
+        let Some(cap) = self.reconcile_cap(external_ref, now) else {
+            return 0; // no cap applies — never prune
+        };
+        let Some(user_id) = rec
+            .registry
+            .lookup_user_id(external_ref)
+            .unwrap_or_else(|e| {
+                tracing::warn!(external_ref, error = %e, "reconcile user lookup failed");
+                None
+            })
+        else {
+            return 0;
+        };
+        let (labels, ports) = match rec.registry.prune_owned_to_cap(user_id, cap) {
+            Ok(removed) => removed,
+            Err(e) => {
+                tracing::warn!(external_ref, error = %e, "reconcile prune failed");
+                return 0;
+            }
+        };
+        if labels.is_empty() && ports.is_empty() {
+            return 0;
+        }
+        let pruned = labels.len() + ports.len();
+        // Compose pruned labels into the FQDNs the router keys on, then evict the
+        // live routes and notify each affected session out-of-band.
+        let fqdns: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}.{}", rec.domain))
+            .collect();
+        let evicted = rec.router.evict_routes(&fqdns, &ports);
+        for (handle, resource) in evicted {
+            handle.send_ctrl(ethertunnel_proto::frames::ControlFrame::Denied {
+                code: ethertunnel_proto::frames::DenyCode::LimitExceeded,
+                message: format!("tunnel {resource:?} pruned: plan downgrade reduced your limit"),
+            });
+        }
+        tracing::info!(
+            external_ref,
+            cap,
+            pruned,
+            "entitlement downgrade: pruned over-cap tunnels"
+        );
+        pruned
+    }
+
+    /// Reconcile *every* cached user to their current cap. Called from the
+    /// periodic sync sweep so a continuously-connected daemon whose plan was
+    /// downgraded is brought into compliance even if no claim or push arrives.
+    pub fn reconcile_all(&self, now: i64) -> usize {
+        if self.reconciler.load().is_none() {
+            return 0;
+        }
+        let refs = match self.cache.all_external_refs() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "reconcile_all: listing cached refs failed");
+                return 0;
+            }
+        };
+        let mut total = 0;
+        for r in refs {
+            total += self.reconcile_user(&r, now);
+        }
+        total
     }
 
     /// Decide the cap for `external_ref` (the registry user name) at `now`.
@@ -315,6 +453,14 @@ impl EntitlementGate {
         (accepted, rejected)
     }
 
+    /// Verify + ingest a single pushed envelope (the keygate
+    /// `POST /admin/entitlements` path). Returns true iff it passed verification
+    /// and was cached. Same verify+upsert+reconcile path as the poll sync, so a
+    /// pushed downgrade prunes over-cap tunnels immediately.
+    pub fn ingest_one(&self, env: &SignedEnvelope, now: i64) -> bool {
+        self.accept(env, now)
+    }
+
     /// Validate one envelope and upsert it. Returns false (and logs) on any
     /// validation failure.
     fn accept(&self, env: &SignedEnvelope, now: i64) -> bool {
@@ -354,10 +500,16 @@ impl EntitlementGate {
             expires_at,
             updated_at: now,
         };
+        let external_ref = ent.external_ref.clone();
         if let Err(e) = self.cache.upsert(&ent) {
             tracing::warn!(error = %e, "entitlement upsert failed");
             return false;
         }
+        // A freshly-ingested envelope may carry a *lower* cap (downgrade / suspend
+        // / cancel). Reconcile this user's live state immediately so over-cap
+        // owned tunnels are pruned and their routes torn down right away, instead
+        // of only biting at the next claim. No-op if no reconciler is installed.
+        self.reconcile_user(&external_ref, now);
         true
     }
 }
@@ -439,6 +591,16 @@ pub fn spawn_sync(
                     tracing::warn!(error = %e, "keygate entitlement sync failed; keeping cache");
                 }
             }
+            // Sweep reconcile: bring every cached user into compliance with its
+            // current cap. `ingest` already reconciles users whose envelope just
+            // changed; this catches a continuously-connected daemon that was
+            // downgraded while the relay couldn't reach keygate, or any drift
+            // (e.g. routes that came up between syncs). Cheap when nothing is
+            // over-cap (a count check per user, no deletes).
+            let pruned = gate.reconcile_all(now_unix());
+            if pruned > 0 {
+                tracing::info!(pruned, "keygate sweep pruned over-cap tunnels");
+            }
             tokio::time::sleep(interval).await;
         }
     });
@@ -489,6 +651,13 @@ mod tests {
         (sk, pk)
     }
 
+    // A far-future expiry so tests that read `cap_for(.., now_unix())` are not
+    // time-bombs: a fixed near-past expiry would silently age past the staleness
+    // ceiling as the wall clock advances and flip Cap/DenyAll to Allow. The
+    // ceiling math itself is exercised separately in `staleness_ceiling_and_status`
+    // with explicit `now` values, so it does not need a near-term expiry here.
+    const PAYLOAD_EXPIRES: &str = "2099-01-01T06:00:00Z";
+
     fn payload(max: i64) -> EntitlementPayload {
         let mut ents = BTreeMap::new();
         ents.insert("max_tunnels".to_string(), serde_json::json!(max));
@@ -499,7 +668,7 @@ mod tests {
             entitlements: ents,
             status: "active".to_string(),
             issued_at: "2026-06-13T00:00:00Z".to_string(),
-            expires_at: "2026-06-13T06:00:00Z".to_string(),
+            expires_at: PAYLOAD_EXPIRES.to_string(),
             key_id: "kg-2026-06".to_string(),
         }
     }
@@ -584,8 +753,9 @@ mod tests {
         let env = envelope(&sk, payload(5));
         gate.ingest(std::slice::from_ref(&env), now_unix());
 
-        // expires_at = 2026-06-13T06:00:00Z = 1_781_308_800 + 6h.
-        let expires = 1_781_308_800_i64 + 6 * 3600;
+        // Drive the ceiling with explicit `now` values pinned to the payload's
+        // (far-future) expiry so this test is wall-clock-independent.
+        let expires = parse_unix_z(PAYLOAD_EXPIRES).unwrap();
         assert_eq!(gate.cap_for("mat", expires + 50), CapDecision::Cap(5)); // within ceiling
         assert_eq!(gate.cap_for("mat", expires + 200), CapDecision::Allow); // past ceiling → missing
 
@@ -600,6 +770,60 @@ mod tests {
         };
         let gate2 = EntitlementGate::new(EntitlementCache::open_in_memory().unwrap(), policy2);
         assert_eq!(gate2.cap_for("nobody", now_unix()), CapDecision::DenyAll);
+    }
+
+    /// P0-2: require_entitlement is the hosted/commercial fail-CLOSED switch.
+    /// With it true, a user with NO cached entitlement, and a user with a cached
+    /// *suspended* or *cancelled* one, both deny all new claims. With it false
+    /// (self-host / fail-open default), a missing entitlement allows the claim.
+    #[test]
+    fn require_entitlement_fail_closed_vs_open() {
+        let (sk, pk) = signer(21);
+        let policy_strict = KeygatePolicy {
+            product: "ethertunnel".into(),
+            public_key_b64: pk.clone(),
+            key_id: "kg-2026-06".into(),
+            staleness_ceiling_secs: 259_200,
+            require_entitlement: true,
+        };
+        let gate = EntitlementGate::new(EntitlementCache::open_in_memory().unwrap(), policy_strict);
+
+        // (1) require_entitlement=true + missing entitlement => DenyAll.
+        assert_eq!(gate.cap_for("nobody", now_unix()), CapDecision::DenyAll);
+
+        // (2) require_entitlement=true + cached SUSPENDED => DenyAll.
+        let mut sus = payload(10);
+        sus.status = "suspended".into();
+        gate.ingest(std::slice::from_ref(&envelope(&sk, sus)), now_unix());
+        assert_eq!(gate.cap_for("mat", now_unix()), CapDecision::DenyAll);
+
+        // (2b) require_entitlement=true + a CANCELLED customer => DenyAll. keygate
+        // stops emitting envelopes for a cancelled customer, so their last cached
+        // envelope ages past the staleness ceiling; once stale it is treated as
+        // missing, and under require_entitlement missing => DenyAll. We assert
+        // that staleness path with an explicit (far-future) `now` so the test is
+        // wall-clock-independent.
+        let mut cancelled = payload(5);
+        cancelled.external_ref = Some("gone".into());
+        gate.ingest(std::slice::from_ref(&envelope(&sk, cancelled)), now_unix());
+        let expires = parse_unix_z(PAYLOAD_EXPIRES).unwrap();
+        assert_eq!(
+            gate.cap_for("gone", expires + 259_200 + 10),
+            CapDecision::DenyAll,
+            "a cancelled customer whose envelopes stopped must deny once stale"
+        );
+
+        // (3) require_entitlement=false + missing entitlement => Allow.
+        let policy_open = KeygatePolicy {
+            product: "ethertunnel".into(),
+            public_key_b64: pk,
+            key_id: "kg-2026-06".into(),
+            staleness_ceiling_secs: 259_200,
+            require_entitlement: false,
+        };
+        let gate_open =
+            EntitlementGate::new(EntitlementCache::open_in_memory().unwrap(), policy_open);
+        assert_eq!(gate_open.cap_for("nobody", now_unix()), CapDecision::Allow);
     }
 
     #[test]
@@ -618,6 +842,85 @@ mod tests {
         let env = envelope(&sk, p);
         gate.ingest(std::slice::from_ref(&env), now_unix());
         assert_eq!(gate.cap_for("mat", now_unix()), CapDecision::DenyAll);
+    }
+
+    /// P1-D: ingesting a *lower* cap reconciles live state — over-cap owned rows
+    /// are pruned (newest dropped, oldest kept) and the matching live routes are
+    /// torn down with a Denied{LimitExceeded}. Drives the gate end-to-end with a
+    /// real registry + router + reconciler.
+    #[tokio::test]
+    async fn downgrade_ingest_prunes_and_evicts_routes() {
+        use crate::auth::Authenticator;
+        use crate::registry::Registry;
+        use crate::router::{Router, SessionHandle};
+        use ethertunnel_proto::frames::{ControlFrame, DenyCode};
+        use tokio::sync::mpsc;
+
+        let (sk, pk) = signer(31);
+        let policy = KeygatePolicy {
+            product: "ethertunnel".into(),
+            public_key_b64: pk,
+            key_id: "kg-2026-06".into(),
+            staleness_ceiling_secs: 259_200,
+            require_entitlement: false,
+        };
+        let gate = EntitlementGate::new(EntitlementCache::open_in_memory().unwrap(), policy);
+
+        // Registry: user "mat" owns three labels with increasing created_at.
+        let registry = std::sync::Arc::new(Registry::open_in_memory("ethertunnel.com").unwrap());
+        let mat = registry.add_user("mat").unwrap();
+        for label in ["a", "b", "c"] {
+            registry.claim_label(mat, label).unwrap();
+        }
+        // Router: route the newest two ("b", "c") on a live session so eviction
+        // has something to tear down + notify.
+        let router = std::sync::Arc::new(Router::new());
+        let (tx, mut rx) = mpsc::channel::<ControlFrame>(16);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let handle = SessionHandle::new(7, mat, tx, cmd_tx);
+        router.claim(
+            &handle,
+            &["b.ethertunnel.com".into(), "c.ethertunnel.com".into()],
+            &[],
+        );
+
+        gate.set_reconciler(std::sync::Arc::new(Reconciler {
+            registry: registry.clone(),
+            router: router.clone(),
+            domain: "ethertunnel.com".into(),
+        }));
+
+        // First ingest at cap 3: no prune (owned == cap).
+        let env3 = envelope(&sk, payload(3));
+        gate.ingest(std::slice::from_ref(&env3), now_unix());
+        assert_eq!(registry.count_owned_resources(mat).unwrap(), 3);
+
+        // Downgrade to cap 1: prune the two newest owned labels ("b","c"), keep
+        // the oldest ("a"). The two routed labels are torn down + Denied'd.
+        let env1 = envelope(&sk, payload(1));
+        let (ok, _) = gate.ingest(std::slice::from_ref(&env1), now_unix());
+        assert_eq!(ok, 1);
+        assert_eq!(registry.count_owned_resources(mat).unwrap(), 1);
+        assert!(registry.owns_hostname(mat, "a.ethertunnel.com"));
+        assert!(!registry.owns_hostname(mat, "b.ethertunnel.com"));
+        assert!(!registry.owns_hostname(mat, "c.ethertunnel.com"));
+        // Both routed labels were evicted.
+        assert!(router.lookup_http("b.ethertunnel.com").is_none());
+        assert!(router.lookup_http("c.ethertunnel.com").is_none());
+        // The session received a Denied for each pruned-and-routed label.
+        let mut denied = 0;
+        while let Ok(frame) = rx.try_recv() {
+            if matches!(
+                frame,
+                ControlFrame::Denied {
+                    code: DenyCode::LimitExceeded,
+                    ..
+                }
+            ) {
+                denied += 1;
+            }
+        }
+        assert_eq!(denied, 2, "each pruned live route must be Denied'd");
     }
 
     /// On-disk entitlement cache (+ WAL/SHM) must be chmodded 0600 after open —

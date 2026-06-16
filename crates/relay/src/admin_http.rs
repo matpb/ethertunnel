@@ -46,6 +46,11 @@ const MAX_EXTERNAL_REF: usize = 64;
 pub struct ProvisionState {
     pub registry: Arc<Registry>,
     pub token: String,
+    /// The keygate entitlement gate, when entitlement enforcement is configured.
+    /// `Some` lets keygate's signed `POST /admin/entitlements` push land in the
+    /// cache immediately (instead of waiting up to one poll interval). `None`
+    /// (provisioning configured but `[keygate]` not) => that endpoint 404s.
+    pub entitlements: Option<Arc<crate::entitlement::EntitlementGate>>,
 }
 
 #[derive(Deserialize)]
@@ -110,7 +115,40 @@ pub async fn handle(ctx: Arc<SessionCtx>, req: Request<hyper::body::Incoming>) -
         "/admin/provision" => handle_provision(&state, &body),
         "/admin/rotate" => handle_rotate(&state, &body),
         "/admin/release" => handle_release(&state, &body),
+        "/admin/entitlements" => handle_entitlements(&state, &body),
         _ => json(StatusCode::NOT_FOUND, &err("not_found")),
+    }
+}
+
+/// `POST /admin/entitlements` — keygate's signed entitlement push. The body is a
+/// single [`SignedEnvelope`] (the SAME type the poll sync verifies). We run it
+/// through the gate's verify+ingest path, so a forged/tampered envelope is
+/// rejected by the Ed25519 signature check regardless of the bearer it presented.
+/// Returns 200 on accept, 400 on a bad signature / unparseable body, and 404
+/// when this relay has provisioning but no `[keygate]` gate to ingest into.
+///
+/// Auth: this arm is only reached after [`authorized`] passed the constant-time
+/// bearer check against the configured provision token, so an unauthenticated
+/// caller can never inject entitlements; the signature is a second, independent
+/// gate (it is the only thing standing between a forged `max_tunnels` and the
+/// cache, exactly as in the poll path).
+fn handle_entitlements(state: &ProvisionState, body: &[u8]) -> Resp {
+    let Some(gate) = state.entitlements.as_ref() else {
+        // Provisioning is configured but entitlement enforcement is not; there is
+        // no cache to ingest into. Behave as if the route doesn't exist.
+        return json(StatusCode::NOT_FOUND, &err("entitlements_not_configured"));
+    };
+    let env: crate::entitlement::SignedEnvelope = match serde_json::from_slice(body) {
+        Ok(e) => e,
+        Err(_) => return json(StatusCode::BAD_REQUEST, &err("invalid_json")),
+    };
+    if gate.ingest_one(&env, crate::entitlement::now_unix()) {
+        tracing::info!("ingested pushed entitlement envelope");
+        json(StatusCode::OK, &serde_json::json!({ "accepted": true }))
+    } else {
+        // Signature / key_id / product / timestamp validation failed. Do not leak
+        // which: a uniform 400 (the poll path logs the specific reason).
+        json(StatusCode::BAD_REQUEST, &err("envelope_rejected"))
     }
 }
 
@@ -260,6 +298,7 @@ mod tests {
         ProvisionState {
             registry: Arc::new(Registry::open_in_memory("ethertunnel.com").unwrap()),
             token: "secret-provision-token".to_owned(),
+            entitlements: None,
         }
     }
 
@@ -368,6 +407,122 @@ mod tests {
     fn release_unknown_user_is_404() {
         let st = state();
         let resp = handle_release(&st, br#"{"external_ref":"acct_missing"}"#);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- P1-E: /admin/entitlements signed-push receiver ---
+
+    use crate::entitlement::{
+        canonical_bytes, EntitlementCache, EntitlementGate, EntitlementPayload, KeygatePolicy,
+    };
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::collections::BTreeMap;
+
+    /// Build the JSON body keygate would POST: a signed envelope over the
+    /// canonical payload bytes. We sign the real [`EntitlementPayload`] (so the
+    /// signature matches what the relay verifies) but emit the wire body as JSON
+    /// directly, since the production `SignedEnvelope` is deserialize-only.
+    fn signed_envelope(sk: &SigningKey, max: i64, status: &str) -> Vec<u8> {
+        let mut ents = BTreeMap::new();
+        ents.insert("max_tunnels".to_string(), serde_json::json!(max));
+        let payload = EntitlementPayload {
+            customer_id: 1,
+            external_ref: Some("acct_push".into()),
+            product: "ethertunnel".into(),
+            entitlements: ents,
+            status: status.into(),
+            issued_at: "2026-06-13T00:00:00Z".into(),
+            // Far-future expiry so the cache read in the assertion is never aged
+            // past the staleness ceiling by the wall clock.
+            expires_at: "2099-01-01T06:00:00Z".into(),
+            key_id: "kg-2026-06".into(),
+        };
+        let sig = sk.sign(&canonical_bytes(&payload));
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let body = serde_json::json!({
+            "payload": {
+                "customer_id": payload.customer_id,
+                "external_ref": payload.external_ref,
+                "product": payload.product,
+                "entitlements": payload.entitlements,
+                "status": payload.status,
+                "issued_at": payload.issued_at,
+                "expires_at": payload.expires_at,
+                "key_id": payload.key_id,
+            },
+            "signature": sig_b64,
+            "key_id": payload.key_id,
+        });
+        serde_json::to_vec(&body).unwrap()
+    }
+
+    fn state_with_gate(sk: &SigningKey) -> ProvisionState {
+        let pk = base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes());
+        let gate = EntitlementGate::new(
+            EntitlementCache::open_in_memory().unwrap(),
+            KeygatePolicy {
+                product: "ethertunnel".into(),
+                public_key_b64: pk,
+                key_id: "kg-2026-06".into(),
+                staleness_ceiling_secs: 259_200,
+                require_entitlement: false,
+            },
+        );
+        ProvisionState {
+            registry: Arc::new(Registry::open_in_memory("ethertunnel.com").unwrap()),
+            token: "secret-provision-token".to_owned(),
+            entitlements: Some(Arc::new(gate)),
+        }
+    }
+
+    #[test]
+    fn entitlements_push_accepts_valid_signature() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let st = state_with_gate(&sk);
+        let body = signed_envelope(&sk, 4, "active");
+        let resp = handle_entitlements(&st, &body);
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The envelope landed in the cache: the gate now caps acct_push at 4.
+        let gate = st.entitlements.as_ref().unwrap();
+        assert_eq!(
+            gate.cap_for("acct_push", crate::entitlement::now_unix()),
+            crate::entitlement::CapDecision::Cap(4)
+        );
+    }
+
+    #[test]
+    fn entitlements_push_rejects_bad_signature() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let st = state_with_gate(&sk);
+        // Sign with a DIFFERENT key than the gate pins => signature fails.
+        let wrong = SigningKey::from_bytes(&[9u8; 32]);
+        let body = signed_envelope(&wrong, 9999, "active");
+        let resp = handle_entitlements(&st, &body);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Nothing was cached.
+        let gate = st.entitlements.as_ref().unwrap();
+        assert_eq!(
+            gate.cap_for("acct_push", crate::entitlement::now_unix()),
+            crate::entitlement::CapDecision::Allow
+        );
+    }
+
+    #[test]
+    fn entitlements_push_bad_json_is_400() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let st = state_with_gate(&sk);
+        let resp = handle_entitlements(&st, br#"{"not":"an envelope"}"#);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn entitlements_push_without_gate_is_404() {
+        // Provisioning configured but no [keygate] gate installed.
+        let st = state();
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let body = signed_envelope(&sk, 4, "active");
+        let resp = handle_entitlements(&st, &body);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
