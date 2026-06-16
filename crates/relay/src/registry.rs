@@ -391,6 +391,65 @@ impl Registry {
         Ok(count)
     }
 
+    /// Every fully-qualified hostname `user_id` currently owns (label composed
+    /// back into an FQDN under this relay's apex), oldest-first. Used by the
+    /// `ListOwned` control frame so a client can reconcile its local config
+    /// against the relay's authoritative ownership.
+    pub fn owned_hostnames(&self, user_id: i64) -> Result<Vec<String>, RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT label FROM hostnames WHERE user_id = ?1 ORDER BY created_at, id",
+        )?;
+        let rows = stmt
+            .query_map([user_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|label| format!("{label}{}", self.suffix))
+            .collect())
+    }
+
+    /// Every public TCP port `user_id` currently owns, ascending.
+    pub fn owned_ports(&self, user_id: i64) -> Result<Vec<u16>, RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT port FROM tcp_ports WHERE user_id = ?1 ORDER BY port")?;
+        let rows = stmt
+            .query_map([user_id], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(rows.into_iter().map(|p| p as u16).collect())
+    }
+
+    /// Release a hostname the caller owns: delete the owned row **only if it
+    /// belongs to `user_id`**, freeing the label (and the cap slot it held) for
+    /// anyone. Returns true iff a row was removed. The `user_id` guard is what
+    /// makes this safe to expose to an authenticated, non-admin daemon: a user
+    /// can only ever release their own labels.
+    pub fn release_hostname_owned(
+        &self,
+        user_id: i64,
+        fqdn: &str,
+    ) -> Result<bool, RegistryError> {
+        let Some(label) = self.label_of(fqdn) else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM hostnames WHERE label = ?1 AND user_id = ?2",
+            rusqlite::params![label, user_id],
+        )? > 0)
+    }
+
+    /// Release a TCP port the caller owns (only if it belongs to `user_id`).
+    /// Returns true iff a row was removed.
+    pub fn release_port_owned(&self, user_id: i64, port: u16) -> Result<bool, RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM tcp_ports WHERE port = ?1 AND user_id = ?2",
+            rusqlite::params![port, user_id],
+        )? > 0)
+    }
+
     /// Register `label` to `user_id` if it is free (first-come-first-served from
     /// the global label pool). Returns:
     ///
@@ -756,6 +815,34 @@ impl Authenticator for Registry {
             }
         }
     }
+
+    fn owned_hostnames(&self, user_id: i64) -> Vec<String> {
+        Registry::owned_hostnames(self, user_id).unwrap_or_else(|e| {
+            tracing::warn!(user_id, error = %e, "owned_hostnames query failed");
+            Vec::new()
+        })
+    }
+
+    fn owned_ports(&self, user_id: i64) -> Vec<u16> {
+        Registry::owned_ports(self, user_id).unwrap_or_else(|e| {
+            tracing::warn!(user_id, error = %e, "owned_ports query failed");
+            Vec::new()
+        })
+    }
+
+    fn release_hostname(&self, user_id: i64, hostname: &str) -> bool {
+        Registry::release_hostname_owned(self, user_id, hostname).unwrap_or_else(|e| {
+            tracing::warn!(user_id, hostname, error = %e, "release_hostname failed");
+            false
+        })
+    }
+
+    fn release_port(&self, user_id: i64, port: u16) -> bool {
+        Registry::release_port_owned(self, user_id, port).unwrap_or_else(|e| {
+            tracing::warn!(user_id, port, error = %e, "release_port failed");
+            false
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1009,6 +1096,54 @@ mod tests {
         r.add_hostname("alpha", "acct_mat").unwrap();
         r.add_port(20002, "acct_mat").unwrap();
         assert_eq!(r.count_owned_resources(mat).unwrap(), 2);
+    }
+
+    /// owned_hostnames returns FQDNs (label + apex), and release_hostname_owned
+    /// only deletes a row that belongs to the caller — freeing the cap slot —
+    /// while refusing to touch another user's label.
+    #[test]
+    fn owned_listing_and_owner_guarded_release() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+        let eve = r.add_user("acct_eve").unwrap();
+        r.claim_label(mat, "myapp").unwrap();
+        r.claim_label(mat, "myapp2").unwrap();
+        r.add_port(20005, "acct_mat").unwrap();
+        r.claim_label(eve, "evil").unwrap();
+
+        assert_eq!(
+            r.owned_hostnames(mat).unwrap(),
+            vec![
+                "myapp.ethertunnel.com".to_string(),
+                "myapp2.ethertunnel.com".to_string()
+            ]
+        );
+        assert_eq!(r.owned_ports(mat).unwrap(), vec![20005]);
+
+        // Eve cannot release Mat's label (owner guard): no row removed, still owned.
+        assert!(!r
+            .release_hostname_owned(eve, "myapp.ethertunnel.com")
+            .unwrap());
+        assert!(r.owns_hostname(mat, "myapp.ethertunnel.com"));
+
+        // Mat releases his own label → freed, cap slot returned.
+        assert!(r
+            .release_hostname_owned(mat, "myapp.ethertunnel.com")
+            .unwrap());
+        assert!(!r.owns_hostname(mat, "myapp.ethertunnel.com"));
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 2); // myapp2 + port
+
+        // Releasing a port the caller owns works; a non-owned one is a no-op.
+        assert!(!r.release_port_owned(eve, 20005).unwrap());
+        assert!(r.release_port_owned(mat, 20005).unwrap());
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 1); // just myapp2
+
+        // Releasing something already gone / never owned is a clean false.
+        assert!(!r
+            .release_hostname_owned(mat, "myapp.ethertunnel.com")
+            .unwrap());
+        // A bogus apex / reserved label resolves to no label → false, never errors.
+        assert!(!r.release_hostname_owned(mat, "myapp.example.org").unwrap());
     }
 
     /// P1-D: prune_owned_to_cap keeps the OLDEST `cap` owned resources (by

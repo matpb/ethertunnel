@@ -70,6 +70,34 @@ pub trait Authenticator: Send + Sync + 'static {
             ClaimOutcome::Taken
         }
     }
+
+    /// Every fully-qualified hostname `user_id` currently owns. Backs the
+    /// `ListOwned` control frame. Default: none (the legacy in-trait impls have
+    /// no enumerable store).
+    fn owned_hostnames(&self, user_id: i64) -> Vec<String> {
+        let _ = user_id;
+        Vec::new()
+    }
+
+    /// Every public TCP port `user_id` currently owns. Backs `ListOwned`.
+    fn owned_ports(&self, user_id: i64) -> Vec<u16> {
+        let _ = user_id;
+        Vec::new()
+    }
+
+    /// Release a hostname the caller owns, freeing the label (and its cap slot).
+    /// Only the caller's own labels are ever affected. Returns true iff a row was
+    /// removed. Default: no-op (immutable legacy store).
+    fn release_hostname(&self, user_id: i64, hostname: &str) -> bool {
+        let _ = (user_id, hostname);
+        false
+    }
+
+    /// Release a TCP port the caller owns. Returns true iff a row was removed.
+    fn release_port(&self, user_id: i64, port: u16) -> bool {
+        let _ = (user_id, port);
+        false
+    }
 }
 
 /// An in-memory `Authenticator` for tests and early milestones.
@@ -190,5 +218,39 @@ impl Authenticator for MemoryAuth {
                 ClaimOutcome::Owned
             }
         }
+    }
+
+    fn owned_hostnames(&self, user_id: i64) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<String> = g
+            .hostnames
+            .get(&user_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    fn owned_ports(&self, user_id: i64) -> Vec<u16> {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<u16> = g
+            .ports
+            .get(&user_id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    }
+
+    fn release_hostname(&self, user_id: i64, hostname: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        g.hostnames
+            .get_mut(&user_id)
+            .is_some_and(|s| s.remove(hostname))
+    }
+
+    fn release_port(&self, user_id: i64, port: u16) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        g.ports.get_mut(&user_id).is_some_and(|s| s.remove(&port))
     }
 }

@@ -76,8 +76,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a tunnel from the config.
+    /// Remove a tunnel from the config and release it on the relay.
     Remove { name: String },
+    /// Release a hostname/port on the relay so it no longer owns the label (and
+    /// the plan slot it holds). Takes a configured tunnel name, or a bare label
+    /// / FQDN for an orphan no longer in the local config.
+    Release { name: String },
     /// Run the client daemon in the foreground.
     Up {
         /// Log for an init system (journald/rolling file) instead of a TTY.
@@ -260,8 +264,18 @@ fn main() -> anyhow::Result<()> {
             tcp,
             local_host,
         } => ethertunnel_client::commands::add(name, port, hostname, tcp, local_host),
-        Command::List { json } => ethertunnel_client::commands::list(json),
-        Command::Remove { name } => ethertunnel_client::commands::remove(name),
+        Command::List { json } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::list(json))
+        }
+        Command::Remove { name } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::remove(name))
+        }
+        Command::Release { name } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(ethertunnel_client::commands::release(name))
+        }
         Command::Up { .. } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(ethertunnel_client::commands::up())

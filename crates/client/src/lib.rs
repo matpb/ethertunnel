@@ -10,6 +10,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod creds;
 pub mod doctor;
 pub mod login;

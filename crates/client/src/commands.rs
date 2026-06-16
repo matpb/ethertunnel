@@ -9,8 +9,10 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{FileConfig, Protocol, TunnelConfig};
+use crate::control::{self, OwnedSet};
 use crate::status::StatusSnapshot;
 use crate::supervisor::{run_supervisor, ConnState, DaemonStatus};
+use crate::tls::TrustMode;
 use crate::{creds, login};
 
 /// Hosted relay used when neither --relay nor a configured relay is present.
@@ -99,8 +101,44 @@ pub fn add(
     Ok(())
 }
 
-/// `etun list` — show configured tunnels.
-pub fn list(json: bool) -> anyhow::Result<()> {
+/// Resolve `(relay, token, trust)` for a remote control request, or an error
+/// explaining what is missing (no relay configured / not logged in).
+fn relay_creds(cfg: &FileConfig) -> anyhow::Result<(String, String, TrustMode)> {
+    if cfg.relay.is_empty() {
+        bail!("no relay configured; run `etun login` first");
+    }
+    let token = creds::resolve(&cfg.relay)?
+        .with_context(|| format!("not logged in to {}; run `etun login`", cfg.relay))?;
+    let trust = cfg.trust_mode()?;
+    Ok((cfg.relay.clone(), token, trust))
+}
+
+/// Print what a `Release` actually freed on the relay.
+fn report_released(freed: &OwnedSet) {
+    if freed.hostnames.is_empty() && freed.tcp_ports.is_empty() {
+        println!("relay: nothing to release (the relay did not have you owning it)");
+        return;
+    }
+    for h in &freed.hostnames {
+        println!("released on relay: {h}");
+    }
+    for p in &freed.tcp_ports {
+        println!("released on relay: tcp port {p}");
+    }
+}
+
+/// The relay-side hostname/port a configured tunnel maps to.
+fn tunnel_resource(cfg: &FileConfig, t: &TunnelConfig) -> (Vec<String>, Vec<u16>) {
+    match t.protocol {
+        Protocol::Http => (vec![cfg.fqdn(t)], vec![]),
+        Protocol::Tcp => (vec![], t.public_port.into_iter().collect()),
+    }
+}
+
+/// `etun list` — show configured tunnels, then reconcile against what the relay
+/// actually owns for this account (so orphaned labels and post-downgrade drift
+/// are visible rather than silently eating the plan's tunnel cap).
+pub async fn list(json: bool) -> anyhow::Result<()> {
     let cfg = FileConfig::load()?;
     if json {
         println!("{}", serde_json::to_string_pretty(&cfg.tunnels)?);
@@ -108,40 +146,142 @@ pub fn list(json: bool) -> anyhow::Result<()> {
     }
     if cfg.tunnels.is_empty() {
         println!("no tunnels configured (use `etun add`)");
-        return Ok(());
+    } else {
+        for t in &cfg.tunnels {
+            match t.protocol {
+                Protocol::Http => println!(
+                    "{:<14} https://{}  ->  {}:{}",
+                    t.name,
+                    cfg.fqdn(t),
+                    t.local_host,
+                    t.port
+                ),
+                Protocol::Tcp => println!(
+                    "{:<14} tcp {}:{}  ->  {}:{}",
+                    t.name,
+                    cfg.relay,
+                    t.public_port.unwrap_or(0),
+                    t.local_host,
+                    t.port
+                ),
+            }
+        }
     }
-    for t in &cfg.tunnels {
-        match t.protocol {
-            Protocol::Http => println!(
-                "{:<14} https://{}  ->  {}:{}",
-                t.name,
-                cfg.fqdn(t),
-                t.local_host,
-                t.port
-            ),
-            Protocol::Tcp => println!(
-                "{:<14} tcp {}:{}  ->  {}:{}",
-                t.name,
-                cfg.relay,
-                t.public_port.unwrap_or(0),
-                t.local_host,
-                t.port
-            ),
+
+    // Best-effort reconcile. Not logged in / no relay → just show local config
+    // (no noise); a reachable relay → surface the authoritative owned set.
+    if let Ok((relay, token, trust)) = relay_creds(&cfg) {
+        match control::list_owned(&relay, &token, &trust).await {
+            Ok(owned) => print_remote_reconcile(&cfg, &owned),
+            Err(e) => eprintln!("\n(relay-owned set unavailable: {e})"),
         }
     }
     Ok(())
 }
 
-/// `etun remove` — delete a tunnel by name.
-pub fn remove(name: String) -> anyhow::Result<()> {
-    let mut cfg = FileConfig::load()?;
-    let before = cfg.tunnels.len();
-    cfg.tunnels.retain(|t| t.name != name);
-    if cfg.tunnels.len() == before {
-        bail!("no such tunnel: {name}");
+/// Compare the relay's authoritative owned set with the local config and flag
+/// orphans (owned on the relay but not configured locally).
+fn print_remote_reconcile(cfg: &FileConfig, owned: &OwnedSet) {
+    use std::collections::HashSet;
+    let local_hosts: HashSet<String> = cfg
+        .tunnels
+        .iter()
+        .filter(|t| matches!(t.protocol, Protocol::Http))
+        .map(|t| cfg.fqdn(t))
+        .collect();
+    let local_ports: HashSet<u16> = cfg
+        .tunnels
+        .iter()
+        .filter_map(|t| (matches!(t.protocol, Protocol::Tcp)).then_some(t.public_port).flatten())
+        .collect();
+
+    if owned.hostnames.is_empty() && owned.tcp_ports.is_empty() {
+        println!("\nRelay owns nothing for this account.");
+        return;
     }
+    println!("\nRelay-owned (authoritative):");
+    let mut orphans = false;
+    for h in &owned.hostnames {
+        if local_hosts.contains(h) {
+            println!("  {h}  (in config)");
+        } else {
+            println!("  {h}  (orphan — not in local config)");
+            orphans = true;
+        }
+    }
+    for p in &owned.tcp_ports {
+        if local_ports.contains(p) {
+            println!("  tcp {p}  (in config)");
+        } else {
+            println!("  tcp {p}  (orphan — not in local config)");
+            orphans = true;
+        }
+    }
+    if orphans {
+        println!(
+            "\nOrphans still count against your plan's tunnel limit. \
+             Free one with `etun release <name-or-label>`."
+        );
+    }
+}
+
+/// `etun remove` — delete a tunnel from local config AND release it on the relay
+/// so the relay stops owning the label (and the cap slot it held). The
+/// server-side release is best-effort: a local-only removal that left the relay
+/// still owning the label is exactly the drift that stranded plan downgrades.
+pub async fn remove(name: String) -> anyhow::Result<()> {
+    let mut cfg = FileConfig::load()?;
+    let Some(idx) = cfg.tunnels.iter().position(|t| t.name == name) else {
+        bail!("no such tunnel: {name}");
+    };
+    let (hosts, ports) = tunnel_resource(&cfg, &cfg.tunnels[idx]);
+    cfg.tunnels.remove(idx);
     cfg.save()?;
-    println!("removed tunnel `{name}`");
+    println!("removed tunnel `{name}` from local config");
+
+    match relay_creds(&cfg) {
+        Ok((relay, token, trust)) => {
+            match control::release(&relay, &token, &trust, hosts, ports).await {
+                Ok(freed) => report_released(&freed),
+                Err(e) => {
+                    eprintln!("note: removed locally, but could not release on the relay: {e}")
+                }
+            }
+        }
+        Err(e) => eprintln!("note: removed locally only (not released on the relay): {e}"),
+    }
+    Ok(())
+}
+
+/// `etun release <name-or-label>` — give up a hostname/port on the relay so it
+/// no longer owns the label (and the cap slot it holds). Resolves a configured
+/// tunnel by name; otherwise treats the argument as a bare label (or full FQDN)
+/// under the relay apex, which is how you clear an orphan no longer in config.
+pub async fn release(target: String) -> anyhow::Result<()> {
+    let cfg = FileConfig::load()?;
+    let (relay, token, trust) = relay_creds(&cfg)?;
+    let (hosts, ports) = match cfg.tunnels.iter().find(|t| t.name == target) {
+        Some(t) => tunnel_resource(&cfg, t),
+        None => {
+            let host = if target.contains('.') {
+                target.clone()
+            } else {
+                format!("{target}.{relay}")
+            };
+            (vec![host], vec![])
+        }
+    };
+    let freed = control::release(&relay, &token, &trust, hosts, ports).await?;
+    if freed.hostnames.is_empty() && freed.tcp_ports.is_empty() {
+        println!("nothing released — the relay does not have you owning `{target}`");
+    } else {
+        for h in &freed.hostnames {
+            println!("released {h}");
+        }
+        for p in &freed.tcp_ports {
+            println!("released tcp port {p}");
+        }
+    }
     Ok(())
 }
 

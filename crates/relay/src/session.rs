@@ -475,6 +475,20 @@ async fn control_task(
             } => {
                 handle_claim(ctx, &handle, &user, hostnames, tcp_ports, &ctrl_tx).await;
             }
+            ControlFrame::Release {
+                hostnames,
+                tcp_ports,
+            } => {
+                handle_release(ctx, &user, hostnames, tcp_ports, &ctrl_tx).await;
+            }
+            ControlFrame::ListOwned => {
+                let _ = ctrl_tx
+                    .send(ControlFrame::Owned {
+                        hostnames: ctx.auth.owned_hostnames(user.user_id),
+                        tcp_ports: ctx.auth.owned_ports(user.user_id),
+                    })
+                    .await;
+            }
             ControlFrame::Goodbye => return Ok(()),
             ControlFrame::Hello { .. } => {
                 let _ = ctrl_tx
@@ -671,6 +685,71 @@ async fn handle_claim(
         .send(ControlFrame::Granted {
             hostnames,
             tcp_ports,
+        })
+        .await;
+}
+
+/// Release resources the caller owns: drop the owned registry rows (freeing the
+/// label/port and the cap slot it held) and tear down any live routes. Only
+/// resources the caller actually owns are touched — `release_*` is owner-guarded
+/// in the registry, so a forged or not-owned entry is a silent no-op. Replies
+/// with the subset that was actually released so the client can reconcile.
+async fn handle_release(
+    ctx: &Arc<SessionCtx>,
+    user: &crate::auth::AuthedUser,
+    hostnames: Vec<String>,
+    tcp_ports: Vec<u16>,
+    ctrl_tx: &mpsc::Sender<ControlFrame>,
+) {
+    // Same per-request bound as claims: a 64 KiB frame can pack thousands of
+    // entries, each costing an ownership-checked delete.
+    if hostnames.len() + tcp_ports.len() > ethertunnel_proto::limits::MAX_CLAIM_ENTRIES {
+        let _ = ctrl_tx
+            .send(ControlFrame::Denied {
+                code: DenyCode::ProtocolError,
+                message: format!(
+                    "release too large (max {} entries)",
+                    ethertunnel_proto::limits::MAX_CLAIM_ENTRIES
+                ),
+            })
+            .await;
+        return;
+    }
+
+    let hostnames: Vec<String> = hostnames.iter().map(|h| h.to_ascii_lowercase()).collect();
+
+    let mut released_hosts = Vec::new();
+    for host in hostnames {
+        if ctx.auth.release_hostname(user.user_id, &host) {
+            released_hosts.push(host);
+        }
+    }
+    let mut released_ports = Vec::new();
+    for port in tcp_ports {
+        if ctx.auth.release_port(user.user_id, port) {
+            released_ports.push(port);
+        }
+    }
+
+    // Tear down any live routes for the just-released resources so a running
+    // daemon stops serving them immediately (the ownership row is already gone,
+    // so it cannot be re-claimed under cap by accident). evict_routes returns the
+    // affected session handles; the release was voluntary, so no extra frame is
+    // pushed to them — the Released reply on this stream is the acknowledgement.
+    if !released_hosts.is_empty() || !released_ports.is_empty() {
+        let _ = ctx.router.evict_routes(&released_hosts, &released_ports);
+        tracing::info!(
+            user = %user.name,
+            hosts = released_hosts.len(),
+            ports = released_ports.len(),
+            "released owned resources by request"
+        );
+    }
+
+    let _ = ctrl_tx
+        .send(ControlFrame::Released {
+            hostnames: released_hosts,
+            tcp_ports: released_ports,
         })
         .await;
 }
@@ -893,6 +972,78 @@ mod tests {
         assert!(router.lookup_http("brandnew.ethertunnel.com").is_some());
         // And it is now owned by the claimant.
         assert!(auth.owns_hostname(uid, "brandnew.ethertunnel.com"));
+    }
+
+    #[tokio::test]
+    async fn list_owned_then_release_frees_resources() {
+        // ListOwned reports the caller's authoritative owned set; Release drops
+        // owned rows + evicts live routes and echoes exactly what it freed.
+        let (ctx, router, _auth, _uid) = fixture(); // mat owns myapp.* + port 20000
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+
+        // Bring the hostname up so there is a live route to tear down on release.
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["myapp.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(recv(&mut ctrl).await, ControlFrame::Granted { .. }));
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
+
+        // ListOwned → both the hostname and the granted port.
+        send(&mut ctrl, ControlFrame::ListOwned).await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Owned {
+                hostnames,
+                tcp_ports,
+            } => {
+                assert_eq!(hostnames, vec!["myapp.ethertunnel.com".to_string()]);
+                assert_eq!(tcp_ports, vec![20000]);
+            }
+            other => panic!("expected Owned, got {other:?}"),
+        }
+
+        // Release the hostname (and a not-owned one, which is ignored).
+        send(
+            &mut ctrl,
+            ControlFrame::Release {
+                hostnames: vec![
+                    "myapp.ethertunnel.com".into(),
+                    "notmine.ethertunnel.com".into(),
+                ],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Released {
+                hostnames,
+                tcp_ports,
+            } => {
+                assert_eq!(hostnames, vec!["myapp.ethertunnel.com".to_string()]);
+                assert!(tcp_ports.is_empty());
+            }
+            other => panic!("expected Released, got {other:?}"),
+        }
+        // Route torn down and ownership gone.
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_none());
+
+        // ListOwned now shows only the still-owned port.
+        send(&mut ctrl, ControlFrame::ListOwned).await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Owned {
+                hostnames,
+                tcp_ports,
+            } => {
+                assert!(hostnames.is_empty());
+                assert_eq!(tcp_ports, vec![20000]);
+            }
+            other => panic!("expected Owned, got {other:?}"),
+        }
     }
 
     #[tokio::test]

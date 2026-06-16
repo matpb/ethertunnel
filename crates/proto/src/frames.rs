@@ -119,6 +119,31 @@ pub enum ControlFrame {
     Shutdown { reason: String },
     /// Either direction. Non-fatal diagnostic.
     Error { code: ErrorCode, message: String },
+    // --- protocol v2 (append-only; only exchanged once Welcome negotiates >= 2) ---
+    /// Daemon → relay. Release these *owned* resources: drop their registry rows
+    /// and tear down any live routes. Only resources the caller actually owns are
+    /// affected; unknown or not-owned entries are silently ignored. Idempotent.
+    /// This is the server-side counterpart to `etun remove`/`etun release`, so a
+    /// user can free a label/port (and the cap slot it holds) without an admin.
+    Release {
+        hostnames: Vec<String>,
+        tcp_ports: Vec<u16>,
+    },
+    /// Relay → daemon. Echoes exactly what was released (the subset the caller
+    /// owned and that is now gone).
+    Released {
+        hostnames: Vec<String>,
+        tcp_ports: Vec<u16>,
+    },
+    /// Daemon → relay. Ask for the caller's authoritative owned-resource set, so
+    /// the client can reconcile its local config against what the relay actually
+    /// holds (surface orphans, self-heal after a plan downgrade pruned a tunnel).
+    ListOwned,
+    /// Relay → daemon. The caller's currently-owned hostnames + TCP ports.
+    Owned {
+        hostnames: Vec<String>,
+        tcp_ports: Vec<u16>,
+    },
 }
 
 /// Preamble written by the relay on every data stream it opens, identifying
@@ -159,5 +184,30 @@ mod tests {
         let dbg = format!("{f:?}");
         assert!(!dbg.contains("leakme"), "token leaked in Debug: {dbg}");
         assert!(dbg.contains("Secret(***)"));
+    }
+
+    /// The v2 frames must survive a postcard encode/decode round-trip exactly —
+    /// they ride the same length-prefixed codec as every other control frame.
+    #[test]
+    fn v2_frames_roundtrip() {
+        for f in [
+            ControlFrame::Release {
+                hostnames: vec!["a.ethertunnel.com".into(), "b.ethertunnel.com".into()],
+                tcp_ports: vec![20001, 20002],
+            },
+            ControlFrame::Released {
+                hostnames: vec!["a.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+            ControlFrame::ListOwned,
+            ControlFrame::Owned {
+                hostnames: vec!["a.ethertunnel.com".into()],
+                tcp_ports: vec![20001],
+            },
+        ] {
+            let bytes = postcard::to_allocvec(&f).unwrap();
+            let back: ControlFrame = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(format!("{f:?}"), format!("{back:?}"));
+        }
     }
 }
