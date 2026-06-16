@@ -282,6 +282,51 @@ impl Registry {
         Ok((token, created))
     }
 
+    /// Rotate a user's bearer token: **revoke every currently-valid token** for
+    /// the account, then mint exactly one fresh token. After this returns, the
+    /// returned plaintext is the *only* credential that authenticates for the
+    /// account — any token issued before now stops working immediately
+    /// (`authenticate` matches `revoked_at IS NULL`).
+    ///
+    /// Used by the keygate-driven self-serve *recovery* path, where the security
+    /// goal is that recovering an account kills any leaked/lost token. Contrast
+    /// [`provision_user_token`], which *adds* a token and leaves old ones valid
+    /// (correct for purchase-time provisioning).
+    ///
+    /// Idempotent on `users.name`: the account is created if absent (so recovery
+    /// converges on "exactly one valid token" even for an account the relay has
+    /// never seen). Returns the fresh plaintext token plus how many previously
+    /// valid tokens were revoked.
+    pub fn rotate_user_token(&self, name: &str) -> Result<(String, usize), RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
+            .optional()?;
+        let id = match existing {
+            Some(id) => id,
+            None => {
+                conn.execute(
+                    "INSERT INTO users (name, created_at) VALUES (?1, ?2)",
+                    rusqlite::params![name, Self::now()],
+                )?;
+                conn.last_insert_rowid()
+            }
+        };
+        // Revoke all currently-valid tokens for this user, then mint one fresh.
+        // Both run under the same connection mutex, so no token minted after the
+        // revoke can be caught by it and no concurrent auth sees an empty window.
+        let revoked = conn.execute(
+            "UPDATE tokens SET revoked_at = ?2 WHERE user_id = ?1 AND revoked_at IS NULL",
+            rusqlite::params![id, Self::now()],
+        )?;
+        let token = generate_token();
+        conn.execute(
+            "INSERT INTO tokens (user_id, token_hash, label, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id, hash_token(&token), Some("self-serve-recovery"), Self::now()],
+        )?;
+        Ok((token, revoked))
+    }
+
     /// Release a user's claimed hostnames (and optionally their reserved TCP
     /// ports) back to the global pool, returning what was released. The user and
     /// their tokens are intentionally *kept*, so a resubscriber retains the same
@@ -720,6 +765,52 @@ mod tests {
             r.authenticate(&t2).unwrap().user_id
         );
         // Exactly one user row exists.
+        assert_eq!(r.list_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rotate_user_token_revokes_all_previous_tokens() {
+        let r = reg();
+        // Give the account two valid tokens the way the live system would: an
+        // initial provision plus a webhook-retry / earlier-recovery addition.
+        let (old1, _) = r.provision_user_token("acct_rot").unwrap();
+        let (old2, _) = r.provision_user_token("acct_rot").unwrap();
+        assert!(r.authenticate(&old1).is_some());
+        assert!(r.authenticate(&old2).is_some());
+
+        // Rotate: both prior tokens must die, exactly one fresh token is minted.
+        let (fresh, revoked) = r.rotate_user_token("acct_rot").unwrap();
+        assert_eq!(revoked, 2, "both previously-valid tokens are revoked");
+        assert_ne!(fresh, old1);
+        assert_ne!(fresh, old2);
+        assert!(
+            r.authenticate(&old1).is_none(),
+            "an old token must fail auth after rotate"
+        );
+        assert!(r.authenticate(&old2).is_none());
+        assert!(
+            r.authenticate(&fresh).is_some(),
+            "the rotated token authenticates"
+        );
+        // Still a single account; no duplicate user created.
+        assert_eq!(r.list_users().unwrap().len(), 1);
+
+        // Rotating again revokes the previous fresh token (count = 1) and issues
+        // a new one; the just-superseded token stops working.
+        let (fresh2, revoked2) = r.rotate_user_token("acct_rot").unwrap();
+        assert_eq!(revoked2, 1);
+        assert!(r.authenticate(&fresh).is_none());
+        assert!(r.authenticate(&fresh2).is_some());
+    }
+
+    #[test]
+    fn rotate_user_token_creates_account_if_absent() {
+        let r = reg();
+        // Recovery converges on "exactly one valid token" even for an account the
+        // relay has never provisioned: rotate creates it, revoking nothing.
+        let (tok, revoked) = r.rotate_user_token("acct_new").unwrap();
+        assert_eq!(revoked, 0);
+        assert!(r.authenticate(&tok).is_some());
         assert_eq!(r.list_users().unwrap().len(), 1);
     }
 

@@ -59,6 +59,13 @@ struct ProvisionResp {
     created: bool,
 }
 
+#[derive(Serialize)]
+struct RotateResp {
+    token: String,
+    /// How many previously-valid tokens were revoked by this rotation.
+    revoked: usize,
+}
+
 #[derive(Deserialize)]
 struct ReleaseReq {
     external_ref: String,
@@ -101,6 +108,7 @@ pub async fn handle(ctx: Arc<SessionCtx>, req: Request<hyper::body::Incoming>) -
 
     match path.as_str() {
         "/admin/provision" => handle_provision(&state, &body),
+        "/admin/rotate" => handle_rotate(&state, &body),
         "/admin/release" => handle_release(&state, &body),
         _ => json(StatusCode::NOT_FOUND, &err("not_found")),
     }
@@ -122,6 +130,31 @@ fn handle_provision(state: &ProvisionState, body: &[u8]) -> Resp {
         }
         Err(e) => {
             tracing::error!(external_ref = %req.external_ref, error = %e, "provision failed");
+            json(StatusCode::INTERNAL_SERVER_ERROR, &err("db_error"))
+        }
+    }
+}
+
+/// `POST /admin/rotate` — revoke every valid token for the account and mint one
+/// fresh token. Used by keygate's self-serve *recovery* path so a recovered
+/// account's leaked/lost tokens stop working. Reuses [`ProvisionReq`] (the body
+/// is just `{"external_ref":"acct_…"}`).
+fn handle_rotate(state: &ProvisionState, body: &[u8]) -> Resp {
+    let req: ProvisionReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(_) => return json(StatusCode::BAD_REQUEST, &err("invalid_json")),
+    };
+    if !valid_ref(&req.external_ref) {
+        return json(StatusCode::BAD_REQUEST, &err("invalid_external_ref"));
+    }
+    match state.registry.rotate_user_token(&req.external_ref) {
+        Ok((token, revoked)) => {
+            // NEVER log the token; only the outcome (incl. how many were killed).
+            tracing::info!(external_ref = %req.external_ref, revoked, "rotated relay account token");
+            json(StatusCode::OK, &RotateResp { token, revoked })
+        }
+        Err(e) => {
+            tracing::error!(external_ref = %req.external_ref, error = %e, "rotate failed");
             json(StatusCode::INTERNAL_SERVER_ERROR, &err("db_error"))
         }
     }
@@ -292,6 +325,34 @@ mod tests {
             .list_hostnames(Some("acct_test1"))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn rotate_revokes_old_tokens_via_route() {
+        use crate::auth::Authenticator;
+        let st = state();
+        // Two valid tokens on the account, as the live system would have.
+        let (old1, _) = st.registry.provision_user_token("acct_rot").unwrap();
+        let (old2, _) = st.registry.provision_user_token("acct_rot").unwrap();
+        assert!(st.registry.authenticate(&old1).is_some());
+        assert!(st.registry.authenticate(&old2).is_some());
+
+        let resp = handle_rotate(&st, br#"{"external_ref":"acct_rot"}"#);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Both prior tokens must now fail auth; the account still exists.
+        assert!(st.registry.authenticate(&old1).is_none());
+        assert!(st.registry.authenticate(&old2).is_none());
+        assert_eq!(st.registry.list_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rotate_bad_ref_is_rejected() {
+        let st = state();
+        let resp = handle_rotate(&st, br#"{"external_ref":""}"#);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = handle_rotate(&st, br#"{"not_ref":"x"}"#);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
