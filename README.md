@@ -31,8 +31,10 @@ ergonomics on infrastructure you control:
 ## Quickstart (60 seconds)
 
 ```sh
-# 1. Install (Linux / macOS).
+# 1. Install the `etun` binary.
+#    Linux / macOS:
 curl -fsSL https://ethertunnel.com/install.sh | sh
+#    Windows (PowerShell):  irm https://ethertunnel.com/install.ps1 | iex
 
 # 2. Log in with a token from your relay operator (verified before it's stored).
 etun login --relay ethertunnel.com --token-stdin
@@ -55,7 +57,8 @@ etun status                   # live daemon state
 etun logs -f                  # follow logs
 etun doctor                   # diagnose config / credentials / relay TLS / auth
 etun service install          # run as a background service (systemd / launchd / Windows)
-etun remove web               # drop a tunnel
+etun remove web               # drop a tunnel (also releases it on the relay)
+etun release web              # free a relay-owned label/port without editing config
 ```
 
 Config lives at `~/.config/etun/config.toml` (no secrets — safe to commit/sync).
@@ -72,6 +75,25 @@ Bearer tokens are stored separately in `credentials.toml` at mode `0600`.
 - **Anti-DoS admission control** on the relay: per-IP accept-rate limiting (IPv6 keyed by /64), connection caps overall and per IP, and a slowloris-bounding header-read timeout.
 - **Cross-platform background service.** `etun service install` survives reboots via systemd (user or hardened system unit), launchd, or Windows services.
 - **Reconnect that just works.** The daemon reconnects with jittered exponential backoff and re-claims its hostnames/ports idempotently (newest-wins on the relay), so a relay restart or network blip self-heals.
+
+## Drive it from your AI agent
+
+EtherTunnel ships an **agent skill** at [`skills/tunnel-manager/SKILL.md`](skills/tunnel-manager/SKILL.md)
+so an AI coding agent can set up and manage tunnels for you. Ask it to "expose
+port 3000" and it runs `etun add` + `etun up`, hands back the public URL, and
+can triage with `etun doctor` — no need to remember the commands yourself.
+
+It's written for **[Claude Code](https://claude.com/claude-code)** — copy the
+folder into your project's `.claude/skills/` (or load it via a plugin) and the
+agent discovers it automatically:
+
+```sh
+mkdir -p .claude/skills && cp -r skills/tunnel-manager .claude/skills/
+```
+
+But it's just a Markdown file with a short YAML header — no lock-in. Any agentic
+system that reads skill/tool descriptions (the Claude Agent SDK, or your own
+harness) can use the same file or port it in minutes.
 
 ## Architecture
 

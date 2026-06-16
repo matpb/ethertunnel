@@ -30,10 +30,20 @@ single outbound connection — no inbound ports, no firewall changes. One binary
 
       etun add ssh 22 --tcp 20022
 
-- List / remove configured tunnels:
+- List configured tunnels (also shows your plan usage and flags any
+  relay-owned labels that are no longer in your config):
 
       etun list [--json]
+
+- Remove a tunnel from the config; this also releases its hostname/port on the
+  relay so it stops counting against your plan's tunnel limit:
+
       etun remove <name>
+
+- Release a hostname/port on the relay directly — handy to free an orphaned
+  label that isn't in your local config (takes a tunnel name or a bare label):
+
+      etun release <name-or-label>
 
 - Run the daemon in the foreground (prints the public URLs once connected):
 
