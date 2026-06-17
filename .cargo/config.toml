@@ -1,0 +1,8 @@
+# Statically link the MSVC C runtime into the Windows binary so it runs on a
+# clean Windows with no Visual C++ Redistributable installed. Without this the
+# .exe dynamically imports vcruntime140.dll and dies at startup with
+# 0xC0000135 STATUS_DLL_NOT_FOUND on machines that lack the VC++ redist
+# (i.e. most fresh Windows installs). Scoped to the windows-msvc target only;
+# the linux-musl and macOS builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
