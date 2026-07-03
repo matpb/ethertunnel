@@ -43,7 +43,7 @@ ProtectClock=true
 ProtectHostname=true
 ProtectKernelLogs=true
 PrivateDevices=true
-# Owner-only files/dirs (completes the DB-perms fix: registry/keygate DBs + certs).
+# Owner-only files/dirs (completes the DB-perms fix: registry/license DBs + certs).
 UMask=0077
 # State the relay may write to (registry DB + issued certs).
 StateDirectory=ethertunnel

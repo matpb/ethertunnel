@@ -46,7 +46,9 @@ pub fn store(relay: &str, token: &str) -> anyhow::Result<()> {
 }
 
 /// Resolve the token for `relay`: `ETUN_TOKEN_FILE` (path) wins, then the
-/// `ETUN_TOKEN` env value, else the file keyed by relay.
+/// `ETUN_TOKEN` env value (with `ETUN_LICENSE_KEY` as a cosmetic alias — a
+/// hosted relay accepts a Polar license key as the bearer credential), else
+/// the file keyed by relay.
 pub fn resolve(relay: &str) -> anyhow::Result<Option<String>> {
     if let Ok(p) = std::env::var("ETUN_TOKEN_FILE") {
         if !p.is_empty() {
@@ -58,9 +60,11 @@ pub fn resolve(relay: &str) -> anyhow::Result<Option<String>> {
             }
         }
     }
-    if let Ok(env) = std::env::var("ETUN_TOKEN") {
-        if !env.is_empty() {
-            return Ok(Some(env));
+    for var in ["ETUN_TOKEN", "ETUN_LICENSE_KEY"] {
+        if let Ok(env) = std::env::var(var) {
+            if !env.is_empty() {
+                return Ok(Some(env));
+            }
         }
     }
     Ok(CredFile::load()?.tokens.get(relay).cloned())

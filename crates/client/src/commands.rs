@@ -42,13 +42,17 @@ pub async fn login(relay: Option<String>, token_stdin: bool) -> anyhow::Result<(
         s.trim().to_owned()
     } else if let Ok(env) = std::env::var("ETUN_TOKEN") {
         env
+    } else if let Ok(env) = std::env::var("ETUN_LICENSE_KEY") {
+        // Cosmetic alias: on the hosted relay the bearer credential IS the
+        // Polar license key.
+        env
     } else if std::io::stdin().is_terminal() {
-        rpassword::prompt_password("Paste your EtherTunnel token: ")
+        rpassword::prompt_password("Paste your EtherTunnel token or license key: ")
             .context("reading token from terminal")?
             .trim()
             .to_owned()
     } else {
-        bail!("provide the token via --token-stdin or the ETUN_TOKEN env var");
+        bail!("provide the token via --token-stdin or the ETUN_TOKEN / ETUN_LICENSE_KEY env var");
     };
     if token.is_empty() {
         bail!("empty token");

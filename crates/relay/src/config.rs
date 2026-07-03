@@ -19,45 +19,13 @@ pub struct Config {
     pub registry: RegistryConfig,
     #[serde(default)]
     pub tcp: TcpConfig,
-    /// keygate licensing integration. Absent => no entitlement enforcement.
+    /// Polar.sh licensing integration. Absent => no license enforcement
+    /// (self-host); clients authenticate by local `etun admin` tokens only.
     #[serde(default)]
-    pub keygate: Option<KeygateConfig>,
+    pub polar: Option<PolarConfig>,
     /// Connection-admission and anti-DoS limits for the public listener.
     #[serde(default)]
     pub limits: LimitsConfig,
-    /// Self-serve provisioning control plane (the keygate-authed `/admin/*`
-    /// endpoints on `connect.<domain>`). Absent => those endpoints are not
-    /// mounted and the relay has no inbound control API, exactly as before.
-    #[serde(default)]
-    pub provision: Option<ProvisionConfig>,
-}
-
-/// Authentication material for the keygate→relay provisioning control plane.
-/// keygate presents the shared bearer token on `/admin/provision` and
-/// `/admin/release`; the relay constant-time-compares it against the contents
-/// of `token_file`.
-#[derive(Clone, Debug, Deserialize)]
-pub struct ProvisionConfig {
-    /// File holding the shared bearer token keygate presents on `/admin/*`
-    /// calls. Kept out of the config (mirrors `KeygateConfig::consumer_token_file`)
-    /// so the secret never lands in a world-readable file.
-    pub token_file: PathBuf,
-}
-
-impl ProvisionConfig {
-    /// Read and trim the shared provisioning bearer token from `token_file`.
-    pub fn token(&self) -> anyhow::Result<String> {
-        let raw = std::fs::read_to_string(&self.token_file)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.token_file.display()))?;
-        let token = raw.trim().to_owned();
-        if token.is_empty() {
-            anyhow::bail!(
-                "provision token file {} is empty",
-                self.token_file.display()
-            );
-        }
-        Ok(token)
-    }
 }
 
 /// Anti-DoS admission limits for the `:443` listener. All have safe defaults so
@@ -152,56 +120,57 @@ fn default_token_revalidate_interval_secs() -> u64 {
     60
 }
 
-/// keygate licensing integration. When present, the relay pulls signed
-/// entitlement envelopes and enforces a per-customer `max_tunnels` cap at claim
-/// time. Absent => no enforcement (self-host / pre-billing), identical to the
-/// relay's pre-integration behavior.
+/// Polar.sh licensing integration. When present, the relay authenticates
+/// clients by their Polar license key (validated against the no-secret
+/// customer-portal endpoint) in addition to local tokens, and enforces the
+/// per-plan `max_tunnels` cap from the `[polar.benefits]` map at claim time.
+/// Absent => no enforcement (self-host), identical to the pre-Polar relay.
+///
+/// The operator's real values (organization id, benefit ids) live only in the
+/// deployed, git-ignored relay.toml — never committed to this repo.
 #[derive(Clone, Debug, Deserialize)]
-pub struct KeygateConfig {
-    /// keygate base URL, e.g. "https://license.ethertunnel.com".
-    pub base_url: String,
-    /// File holding the consumer bearer token (kept out of the config so the
-    /// secret never lands in a world-readable file).
-    pub consumer_token_file: PathBuf,
-    /// keygate's pinned Ed25519 public key (base64, standard) for verifying
-    /// entitlement envelopes offline.
-    pub public_key: String,
-    /// The signing key id the relay accepts (rotation guard).
-    pub key_id: String,
-    /// Product key entitlements are scoped to.
-    #[serde(default = "default_keygate_product")]
-    pub product: String,
-    /// How often to pull the entitlement snapshot from keygate.
-    #[serde(default = "default_keygate_poll_secs")]
-    pub poll_interval_secs: u64,
-    /// Honor a cached envelope at most this many seconds past its `expires_at`.
-    #[serde(default = "default_keygate_staleness_secs")]
-    pub staleness_ceiling_secs: i64,
-    /// Deny users with no fresh cached entitlement (default false: allow them
-    /// through unenforced, so unprovisioned/self-host users are never blocked).
+pub struct PolarConfig {
+    /// The Polar organization whose keys this relay accepts. Public
+    /// identifier (it rides in every customer-portal request body), but
+    /// operator-supplied: no default, never committed.
+    pub organization_id: String,
+    /// Polar API base. Sandbox: "https://sandbox-api.polar.sh".
+    #[serde(default = "default_polar_api_base")]
+    pub api_base: String,
+    /// Re-validate a cached key over HTTP at most this often (seconds).
+    /// Keeps the relay far inside Polar's burst rate limits.
+    #[serde(default = "default_polar_cache_ttl_secs")]
+    pub cache_ttl_secs: i64,
+    /// Honor a cached "granted" this long past its last successful
+    /// validation when Polar is unreachable (bounded fail-open window).
+    #[serde(default = "default_polar_staleness_secs")]
+    pub staleness_secs: i64,
+    /// Enforce `limit_activations` (device binding) by calling Polar
+    /// activate()/deactivate() around claim/release.
+    #[serde(default = "default_polar_activate_on_claim")]
+    pub activate_on_claim: bool,
+    /// `benefit_id -> max_tunnels`. The relay's ONLY source of per-plan
+    /// capacity (the validate response has no product_id and keys carry no
+    /// metadata, so capacity is keyed on the License Key *benefit* id).
+    /// A granted key whose benefit is missing from this map is denied.
     #[serde(default)]
-    pub require_entitlement: bool,
+    pub benefits: std::collections::HashMap<String, i64>,
 }
 
-impl KeygateConfig {
-    /// Read and trim the consumer bearer token from `consumer_token_file`.
-    pub fn token(&self) -> anyhow::Result<String> {
-        let raw = std::fs::read_to_string(&self.consumer_token_file)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.consumer_token_file.display()))?;
-        Ok(raw.trim().to_owned())
-    }
+fn default_polar_api_base() -> String {
+    "https://api.polar.sh".to_owned()
 }
 
-fn default_keygate_product() -> String {
-    "ethertunnel".to_owned()
+fn default_polar_cache_ttl_secs() -> i64 {
+    300
 }
 
-fn default_keygate_poll_secs() -> u64 {
-    60
-}
-
-fn default_keygate_staleness_secs() -> i64 {
+fn default_polar_staleness_secs() -> i64 {
     259_200 // 3 days
+}
+
+fn default_polar_activate_on_claim() -> bool {
+    true
 }
 
 /// Raw-TCP tunnel settings.
@@ -442,5 +411,60 @@ mod tests {
         assert_eq!(l.proxy_idle_timeout_secs, 0); // idle reaping OFF by default
         assert_eq!(l.proxy_absolute_max_secs, 0);
         assert_eq!(l.token_revalidate_interval_secs, 60);
+    }
+
+    /// The `[polar]` block parses with per-field defaults; only
+    /// `organization_id` is required. The `[polar.benefits]` map is the
+    /// benefit_id -> max_tunnels capacity source.
+    #[test]
+    fn polar_block_parses_with_defaults_and_benefits() {
+        let toml = r#"
+            [server]
+            domain = "example.com"
+
+            [polar]
+            organization_id = "00000000-0000-0000-0000-000000000000"
+
+            [polar.benefits]
+            "11111111-1111-1111-1111-111111111111" = 1
+            "22222222-2222-2222-2222-222222222222" = 3
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("[polar] block loads");
+        let p = cfg.polar.expect("polar present");
+        assert_eq!(p.organization_id, "00000000-0000-0000-0000-000000000000");
+        assert_eq!(p.api_base, "https://api.polar.sh");
+        assert_eq!(p.cache_ttl_secs, 300);
+        assert_eq!(p.staleness_secs, 259_200);
+        assert!(p.activate_on_claim);
+        assert_eq!(
+            p.benefits.get("11111111-1111-1111-1111-111111111111"),
+            Some(&1)
+        );
+        assert_eq!(
+            p.benefits.get("22222222-2222-2222-2222-222222222222"),
+            Some(&3)
+        );
+    }
+
+    /// No `[polar]` block => None (self-host: local tokens only, no caps).
+    /// A legacy config still carrying the removed `[keygate]`/`[provision]`
+    /// sections must keep loading — unknown tables are tolerated.
+    #[test]
+    fn no_polar_block_is_none_and_legacy_keygate_is_ignored() {
+        let toml = r#"
+            [server]
+            domain = "example.com"
+
+            [keygate]
+            base_url = "https://license.example.com"
+            consumer_token_file = "/etc/ethertunnel/keygate.token"
+            public_key = "legacy"
+            key_id = "kg-2026-06"
+
+            [provision]
+            token_file = "/etc/ethertunnel/provision.token"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("legacy config loads");
+        assert!(cfg.polar.is_none());
     }
 }

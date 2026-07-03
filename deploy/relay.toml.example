@@ -48,29 +48,38 @@ db_path = "/var/lib/ethertunnel/registry.db"
 # exact `ufw allow 20000:20999/tcp` and cloud-console steps.
 port_range = [20000, 20999]
 
-# keygate licensing / entitlement enforcement. OMIT this whole section for a
-# self-host relay: with no [keygate] block the relay does not enforce any cap and
-# every account is allowed (fail-open) — the correct default for self-host.
+# Polar.sh licensing. OMIT this whole section for a self-host relay: with no
+# [polar] block, clients authenticate by local tokens minted via
+# `etun admin token create` and no tunnel cap is enforced — the correct
+# default for self-host.
 #
-# Hosted / commercial relays MUST include this section AND set
-# require_entitlement = true. With it true, a user with no fresh, signed
-# entitlement is denied (fail-closed); leaving it false (the built-in default)
-# means a relay that loses contact with keygate keeps serving cancelled accounts.
-# [keygate]
-# base_url = "https://license.ethertunnel.com"
-# # File holding the consumer bearer token keygate issued this relay (0600).
-# consumer_token_file = "/etc/ethertunnel/keygate.token"
-# # keygate's pinned Ed25519 public key (base64, standard) used to verify the
-# # signed entitlement envelopes offline.
-# public_key = "BASE64_ED25519_PUBLIC_KEY"
-# # The signing key id this relay accepts (rotation guard).
-# key_id = "kg-2026-06"
-# # Product the entitlements are scoped to.
-# product = "ethertunnel"
-# # How often to pull the entitlement snapshot from keygate (seconds).
-# poll_interval_secs = 60
-# # Honor a cached envelope at most this many seconds past its expires_at.
-# staleness_ceiling_secs = 259200
-# # Hosted/commercial: set TRUE so unentitled users are denied. Self-host leaves
-# # this false (and normally omits the whole [keygate] section).
-# require_entitlement = true
+# With [polar] present, the relay ALSO accepts Polar license keys as bearer
+# credentials: a key is validated against Polar's public customer-portal
+# endpoint (no org secret is ever stored on the relay), a relay account is
+# provisioned implicitly under the Polar customer id, and the per-plan tunnel
+# cap comes from the [polar.benefits] map below. Local admin tokens keep
+# working alongside (they are checked first, with no network call).
+# [polar]
+# # Your Polar organization id (public identifier, but operator-supplied —
+# # fill in your own; never commit a real value to a repo).
+# organization_id = "YOUR-POLAR-ORG-UUID"
+# # Polar API base. Sandbox testing: "https://sandbox-api.polar.sh".
+# api_base = "https://api.polar.sh"
+# # Re-validate a cached key over HTTP at most this often (seconds). Keeps the
+# # relay far inside Polar's customer-portal rate limits.
+# cache_ttl_secs = 300
+# # Honor a cached "granted" this long past its last successful validation if
+# # Polar is unreachable (bounded fail-open window, seconds).
+# staleness_secs = 259200
+# # Enforce limit_activations (device binding) via Polar activate()/deactivate().
+# activate_on_claim = true
+#
+# # License-Key BENEFIT id -> max concurrent tunnels. This map is the relay's
+# # ONLY source of per-plan capacity (Polar's validate response carries the
+# # benefit id, not the product id, and keys hold no custom metadata). A
+# # granted key whose benefit is missing from this map is DENIED — keep it in
+# # sync with the License Key benefits on your Polar products.
+# [polar.benefits]
+# "YOUR-INDIE-LICENSE-BENEFIT-UUID" = 3
+# "YOUR-PRO-LICENSE-BENEFIT-UUID" = 10
+# "YOUR-TEAM-LICENSE-BENEFIT-UUID" = 30

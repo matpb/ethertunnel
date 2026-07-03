@@ -73,14 +73,11 @@ pub struct SessionCtx {
     /// shutdown token exist. `None` means TCP tunnels are unavailable (tests,
     /// or before installation), and TCP claims are denied.
     pub tcp: arc_swap::ArcSwapOption<crate::tcp::TcpPortManager>,
-    /// keygate entitlement gate, installed by `serve` when `[keygate]` is
-    /// configured. `None` means no enforcement (self-host / pre-billing): every
-    /// owned claim is allowed, exactly as before this integration.
-    pub entitlements: arc_swap::ArcSwapOption<crate::entitlement::EntitlementGate>,
-    /// keygate-authed provisioning control plane, installed by `run_serve` when
-    /// `[provision]` is configured. `None` means the `/admin/*` provisioning
-    /// endpoints are not mounted (the relay has no inbound control API).
-    pub provision: arc_swap::ArcSwapOption<crate::admin_http::ProvisionState>,
+    /// Polar license gate, installed by `run_serve` when `[polar]` is
+    /// configured. `None` means no license auth and no cap enforcement
+    /// (self-host): only local tokens authenticate, every owned claim is
+    /// allowed, exactly as before this integration.
+    pub polar: arc_swap::ArcSwapOption<crate::polar::PolarGate>,
     /// Caps concurrent *live* daemon control sessions (global + per-/64), held
     /// for each session's whole lifetime. Separate from the accept-time
     /// ConnLimiter (which the move-only ConnPermit can't reach inside the `Fn`
@@ -107,8 +104,7 @@ impl SessionCtx {
             auth,
             server_version,
             tcp: arc_swap::ArcSwapOption::empty(),
-            entitlements: arc_swap::ArcSwapOption::empty(),
-            provision: arc_swap::ArcSwapOption::empty(),
+            polar: arc_swap::ArcSwapOption::empty(),
             session_limiter: arc_swap::ArcSwapOption::empty(),
             token_revalidate_interval: AtomicU64::new(TOKEN_REVALIDATE_INTERVAL.as_millis() as u64),
             next_session_id: AtomicU64::new(1),
@@ -132,21 +128,15 @@ impl SessionCtx {
         Duration::from_millis(self.token_revalidate_interval.load(Ordering::Relaxed))
     }
 
-    /// Install the keygate provisioning control plane (called by `run_serve`
-    /// when `[provision]` is configured).
-    pub fn set_provision(&self, state: Arc<crate::admin_http::ProvisionState>) {
-        self.provision.store(Some(state));
-    }
-
     /// Install the raw-TCP port manager (called by `serve`).
     pub fn set_tcp(&self, manager: Arc<crate::tcp::TcpPortManager>) {
         self.tcp.store(Some(manager));
     }
 
-    /// Install the keygate entitlement gate (called by `run_serve` when
-    /// `[keygate]` is configured).
-    pub fn set_entitlements(&self, gate: Arc<crate::entitlement::EntitlementGate>) {
-        self.entitlements.store(Some(gate));
+    /// Install the Polar license gate (called by `run_serve` when `[polar]`
+    /// is configured).
+    pub fn set_polar(&self, gate: Arc<crate::polar::PolarGate>) {
+        self.polar.store(Some(gate));
     }
 
     fn next_id(&self) -> u64 {
@@ -158,6 +148,22 @@ impl SessionCtx {
 fn negotiate(peer_min: u16, peer_max: u16) -> Option<u16> {
     let v = peer_max.min(PROTOCOL_VERSION);
     (v >= peer_min && v >= 1).then_some(v)
+}
+
+/// Resolve a presented credential to a user: the local token store first (a
+/// cheap in-process hash lookup, and the only path on a self-host relay),
+/// then — when `[polar]` is configured — Polar license-key validation. Used
+/// by both the handshake and the periodic re-validation tick, so a Polar-
+/// authed session survives re-validation exactly as long as its key stays
+/// granted (the gate caches, so the tick usually costs no HTTP).
+async fn authenticate_any(ctx: &SessionCtx, token: &str) -> Option<crate::auth::AuthedUser> {
+    if let Some(user) = ctx.auth.authenticate(token) {
+        return Some(user);
+    }
+    match ctx.polar.load_full() {
+        Some(gate) => gate.authenticate(token).await,
+        None => None,
+    }
 }
 
 /// Drive one daemon connection until it closes. Assigns the session id, waits
@@ -356,7 +362,7 @@ async fn control_task(
         return Ok(());
     };
 
-    let Some(user) = ctx.auth.authenticate(token.expose()) else {
+    let Some(user) = authenticate_any(ctx, token.expose()).await else {
         deny(rd, &mut wr, DenyCode::AuthFailed, "authentication failed").await?;
         return Ok(());
     };
@@ -402,12 +408,14 @@ async fn control_task(
                 biased;
                 r = &mut read => break r,
                 _ = revalidate_tick.tick(), if !revalidate.is_zero() => {
-                    // Re-resolve the token. None (revoked/deleted) or a different
-                    // user_id (token reissued to another user) => terminate.
-                    match ctx.auth.authenticate(token.expose()) {
+                    // Re-resolve the credential. None (revoked local token, or a
+                    // Polar key that stopped validating — cancel propagates in
+                    // seconds and the gate re-checks over HTTP once per its cache
+                    // TTL) or a different user_id (token reissued) => terminate.
+                    match authenticate_any(ctx, token.expose()).await {
                         Some(u) if u.user_id == user.user_id => {}
                         _ => {
-                            tracing::info!(session_id, "token revoked; closing session");
+                            tracing::info!(session_id, "credential revoked; closing session");
                             let _ = ctrl_tx
                                 .send(ControlFrame::Denied {
                                     code: DenyCode::AuthFailed,
@@ -422,24 +430,21 @@ async fn control_task(
                             return Ok(());
                         }
                     }
-                    // The token still resolves to this user, but the *entitlement*
-                    // may have lapsed (cancelled/suspended) since the session came
-                    // up. The claim-time gate only fires on NEW claims, so a
-                    // cancelled customer keeps serving on already-routed tunnels
-                    // until they disconnect. Consult the gate here on the same
-                    // cadence so cancel/suspend stops LIVE traffic within one
-                    // interval. This reads only the already-synced, signature-
-                    // verified cache (no hot-path keygate call) and respects the
-                    // policy's staleness ceiling / require_entitlement semantics:
-                    // self-host (no gate installed) and unentitled-but-allowed
-                    // users are unaffected (only CapDecision::DenyAll terminates).
-                    if let Some(gate) = ctx.entitlements.load_full() {
-                        use crate::entitlement::{now_unix, CapDecision};
+                    // The credential still resolves to this user, but the license
+                    // may have flipped to a state that denies all claims (e.g. a
+                    // benefit no longer mapped in [polar.benefits]). The claim-time
+                    // gate only fires on NEW claims, so consult the gate here on
+                    // the same cadence so a lapse stops LIVE traffic within one
+                    // interval. Reads the local validation cache (no extra HTTP);
+                    // self-host (no gate) and local-token users are unaffected
+                    // (only CapDecision::DenyAll terminates).
+                    if let Some(gate) = ctx.polar.load_full() {
+                        use crate::polar::{now_unix, CapDecision};
                         if gate.cap_for(&user.name, now_unix()) == CapDecision::DenyAll {
                             tracing::info!(
                                 session_id,
                                 user = %user.name,
-                                "entitlement lapsed; closing session"
+                                "license lapsed; closing session"
                             );
                             let _ = ctrl_tx
                                 .send(ControlFrame::Denied {
@@ -473,25 +478,34 @@ async fn control_task(
                 hostnames,
                 tcp_ports,
             } => {
-                handle_claim(ctx, &handle, &user, hostnames, tcp_ports, &ctrl_tx).await;
+                handle_claim(
+                    ctx,
+                    &handle,
+                    &user,
+                    token.expose(),
+                    hostnames,
+                    tcp_ports,
+                    &ctrl_tx,
+                )
+                .await;
             }
             ControlFrame::Release {
                 hostnames,
                 tcp_ports,
             } => {
-                handle_release(ctx, &user, hostnames, tcp_ports, &ctrl_tx).await;
+                handle_release(ctx, &user, token.expose(), hostnames, tcp_ports, &ctrl_tx).await;
             }
             ControlFrame::ListOwned => {
                 // Report the cap the relay already enforces (advisory only). No
-                // entitlement gate (self-host / no licensing) => no cap. An
-                // uncapped/`Allow` plan also reports `None`; a suspended/cancelled
-                // account reports `Some(0)`.
-                let max_tunnels = ctx.entitlements.load_full().and_then(|gate| {
-                    use crate::entitlement::{now_unix, CapDecision};
+                // Polar gate (self-host / no licensing) => no cap. An
+                // uncapped/`Allow` local-token user also reports `None`; a
+                // revoked/lapsed account reports `Some(0)`.
+                let max_tunnels = ctx.polar.load_full().and_then(|gate| {
+                    use crate::polar::{now_unix, CapDecision};
                     match gate.cap_for(&user.name, now_unix()) {
                         CapDecision::Allow => None,
-                        // Clamp like reconcile_cap does: never hand the client a
-                        // negative cap (it would wrap when compared as usize).
+                        // Clamp: never hand the client a negative cap (it would
+                        // wrap when compared as usize).
                         CapDecision::Cap(m) => Some(m.max(0)),
                         CapDecision::DenyAll => Some(0),
                     }
@@ -519,11 +533,14 @@ async fn control_task(
     }
 }
 
-/// Validate and apply a claim (atomic, idempotent), then reply.
+/// Validate and apply a claim (atomic, idempotent), then reply. `token` is
+/// the session's presented credential, needed so a Polar-licensed claim can
+/// hold its device activation (`limit_activations`).
 async fn handle_claim(
     ctx: &Arc<SessionCtx>,
     handle: &SessionHandle,
     user: &crate::auth::AuthedUser,
+    token: &str,
     hostnames: Vec<String>,
     tcp_ports: Vec<u16>,
     ctrl_tx: &mpsc::Sender<ControlFrame>,
@@ -582,13 +599,11 @@ async fn handle_claim(
         }
     }
 
-    // keygate entitlement enforcement runs BEFORE any hostname is registered, so
-    // we never persist a label the cap would reject (no leaked rows). Fail-open:
-    // when no gate is installed, or the customer has no fresh cached entitlement,
-    // the claim proceeds. Only an active cap that this claim would exceed (or a
-    // suspended account) is denied. The projected count includes the requested
-    // hostnames/ports regardless of whether they're already registered, matching
-    // the existing "concurrently active tunnels" semantics.
+    // Polar license enforcement runs BEFORE any hostname is registered, so
+    // we never persist a label the cap would reject (no leaked rows). When no
+    // gate is installed (self-host), or the user is a local-token account with
+    // no license row (ops), the claim proceeds uncapped. Only an active cap
+    // that this claim would exceed (or a revoked/lapsed license) is denied.
     // The authoritative cap, when one applies, is enforced against OWNED
     // registry rows inside `claim_hostname` (atomic with the insert). This
     // `cap` carries the active limit through to that call. The projected
@@ -596,8 +611,21 @@ async fn handle_claim(
     // over-claims early; it is NOT authoritative, because routed counts drop to
     // zero on disconnect while owned rows persist (the squatting hole).
     let mut cap: Option<i64> = None;
-    if let Some(gate) = ctx.entitlements.load_full() {
-        use crate::entitlement::{now_unix, CapDecision};
+    if let Some(gate) = ctx.polar.load_full() {
+        use crate::polar::{now_unix, CapDecision};
+        // Device binding: the first claim on a Polar key activates it (and a
+        // reconnect re-uses the stored activation). A key already activated
+        // elsewhere is refused before any label is registered. Local tokens
+        // pass straight through (no license row -> no-op Ok).
+        if let Err(why) = gate.ensure_activated(token).await {
+            let _ = ctrl_tx
+                .send(ControlFrame::Denied {
+                    code: DenyCode::LimitExceeded,
+                    message: why,
+                })
+                .await;
+            return;
+        }
         match gate.cap_for(&user.name, now_unix()) {
             CapDecision::Allow => {}
             CapDecision::DenyAll => {
@@ -712,6 +740,7 @@ async fn handle_claim(
 async fn handle_release(
     ctx: &Arc<SessionCtx>,
     user: &crate::auth::AuthedUser,
+    token: &str,
     hostnames: Vec<String>,
     tcp_ports: Vec<u16>,
     ctrl_tx: &mpsc::Sender<ControlFrame>,
@@ -759,6 +788,17 @@ async fn handle_release(
             ports = released_ports.len(),
             "released owned resources by request"
         );
+        // If this account just released its LAST owned resource, free the
+        // Polar device activation too so the key can be used from another
+        // machine without waiting for the operator. Best-effort; a no-op for
+        // local tokens and non-activated keys.
+        if let Some(gate) = ctx.polar.load_full() {
+            if ctx.auth.owned_hostnames(user.user_id).is_empty()
+                && ctx.auth.owned_ports(user.user_id).is_empty()
+            {
+                gate.release_activation(token).await;
+            }
+        }
     }
 
     let _ = ctrl_tx
@@ -1070,30 +1110,12 @@ mod tests {
 
     #[tokio::test]
     async fn list_owned_reports_plan_cap_when_gated() {
-        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        use crate::polar::test_support::{gate_with, seed_license, MockBackend};
         let (ctx, _router, _auth, _uid) = fixture(); // user name "mat"
-        let cache = EntitlementCache::open_in_memory().unwrap();
-        cache
-            .upsert(&Entitlement {
-                external_ref: "mat".into(),
-                customer_id: 1,
-                max_tunnels: Some(3),
-                status: "active".into(),
-                issued_at: 0,
-                expires_at: i64::MAX,
-                updated_at: 0,
-            })
-            .unwrap();
-        ctx.set_entitlements(Arc::new(EntitlementGate::new(
-            cache,
-            KeygatePolicy {
-                product: "ethertunnel".into(),
-                public_key_b64: String::new(),
-                key_id: "k1".into(),
-                staleness_ceiling_secs: 0,
-                require_entitlement: false,
-            },
-        )));
+        let (gate, _reg, _rt) = gate_with(Arc::new(MockBackend::default()), &[]);
+        // A licensed customer whose session user name is "mat", capped at 3.
+        seed_license(&gate, "CMND-SEED", "mat", "granted", Some(3));
+        ctx.set_polar(gate);
 
         let mut ctrl = connect(ctx).await;
         handshake(&mut ctrl, "etun_good").await;
@@ -1107,40 +1129,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_owned_reports_suspended_as_some_zero() {
-        // A suspended/cancelled account (cap_for -> DenyAll) must report Some(0)
+    async fn list_owned_reports_revoked_as_some_zero() {
+        // A revoked/lapsed license (cap_for -> DenyAll) must report Some(0)
         // so the client shows the "subscription inactive" advisory, not a cap.
-        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        use crate::polar::test_support::{gate_with, seed_license, MockBackend};
         let (ctx, _router, _auth, _uid) = fixture();
-        let cache = EntitlementCache::open_in_memory().unwrap();
-        cache
-            .upsert(&Entitlement {
-                external_ref: "mat".into(),
-                customer_id: 1,
-                max_tunnels: Some(10),
-                status: "suspended".into(),
-                issued_at: 0,
-                expires_at: i64::MAX,
-                updated_at: 0,
-            })
-            .unwrap();
-        ctx.set_entitlements(Arc::new(EntitlementGate::new(
-            cache,
-            KeygatePolicy {
-                product: "ethertunnel".into(),
-                public_key_b64: String::new(),
-                key_id: "k1".into(),
-                staleness_ceiling_secs: 0,
-                require_entitlement: false,
-            },
-        )));
+        let (gate, _reg, _rt) = gate_with(Arc::new(MockBackend::default()), &[]);
+        seed_license(&gate, "CMND-SEED", "mat", "not_licensed", Some(10));
+        ctx.set_polar(gate);
 
         let mut ctrl = connect(ctx).await;
         handshake(&mut ctrl, "etun_good").await;
         send(&mut ctrl, ControlFrame::ListOwned).await;
         match recv(&mut ctrl).await {
             ControlFrame::Owned { max_tunnels, .. } => {
-                assert_eq!(max_tunnels, Some(0), "suspended account must report cap 0");
+                assert_eq!(max_tunnels, Some(0), "revoked license must report cap 0");
             }
             other => panic!("expected Owned, got {other:?}"),
         }
@@ -1148,33 +1151,13 @@ mod tests {
 
     #[tokio::test]
     async fn claim_exceeding_cap_is_denied_and_label_not_registered() {
-        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        use crate::polar::test_support::{gate_with, seed_license, MockBackend};
         let (ctx, router, auth, _uid) = fixture();
 
         // Install a gate capping "mat" at 1 concurrent tunnel.
-        let cache = EntitlementCache::open_in_memory().unwrap();
-        cache
-            .upsert(&Entitlement {
-                external_ref: "mat".into(),
-                customer_id: 1,
-                max_tunnels: Some(1),
-                status: "active".into(),
-                issued_at: 0,
-                expires_at: i64::MAX,
-                updated_at: 0,
-            })
-            .unwrap();
-        let gate = EntitlementGate::new(
-            cache,
-            KeygatePolicy {
-                product: "ethertunnel".into(),
-                public_key_b64: String::new(),
-                key_id: "k1".into(),
-                staleness_ceiling_secs: 0,
-                require_entitlement: false,
-            },
-        );
-        ctx.set_entitlements(Arc::new(gate));
+        let (gate, _reg, _rt) = gate_with(Arc::new(MockBackend::default()), &[]);
+        seed_license(&gate, "CMND-SEED", "mat", "granted", Some(1));
+        ctx.set_polar(gate);
 
         let mut ctrl = connect(ctx).await;
         handshake(&mut ctrl, "etun_good").await;
@@ -1204,32 +1187,12 @@ mod tests {
         // count drops to 0 but the owned row persists), then a NEW session tries
         // a DIFFERENT free label. The authoritative owned-row cap inside
         // claim_hostname must deny it even though the routed/projected count is 0.
-        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        use crate::polar::test_support::{gate_with, seed_license, MockBackend};
         let (ctx, _router, auth, uid) = fixture();
 
-        let cache = EntitlementCache::open_in_memory().unwrap();
-        cache
-            .upsert(&Entitlement {
-                external_ref: "mat".into(),
-                customer_id: 1,
-                max_tunnels: Some(1),
-                status: "active".into(),
-                issued_at: 0,
-                expires_at: i64::MAX,
-                updated_at: 0,
-            })
-            .unwrap();
-        let gate = EntitlementGate::new(
-            cache,
-            KeygatePolicy {
-                product: "ethertunnel".into(),
-                public_key_b64: String::new(),
-                key_id: "k1".into(),
-                staleness_ceiling_secs: 0,
-                require_entitlement: false,
-            },
-        );
-        ctx.set_entitlements(Arc::new(gate));
+        let (gate, _reg, _rt) = gate_with(Arc::new(MockBackend::default()), &[]);
+        seed_license(&gate, "CMND-SEED", "mat", "granted", Some(1));
+        ctx.set_polar(gate);
 
         // Simulate the user already owning one label from a prior, now-closed
         // session (MemoryAuth owned rows persist independently of routing).
@@ -1431,46 +1394,24 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), heartbeat).await;
     }
 
-    /// P1-B: a LIVE session whose entitlement lapses (cancel/suspend) must be
-    /// terminated by the in-session revalidation loop within one interval — even
-    /// while the daemon keeps heartbeating (the dead-man can never fire on a
-    /// pinging daemon). The token stays valid the whole time; only the
-    /// entitlement gate flips to DenyAll. We start with an ACTIVE entitlement
-    /// (claim succeeds), then swap in a SUSPENDED gate and assert the route is
-    /// torn down well under the dead-man.
+    /// P1-B: a LIVE session whose license lapses must be terminated by the
+    /// in-session revalidation loop within one interval — even while the
+    /// daemon keeps heartbeating (the dead-man can never fire on a pinging
+    /// daemon). The local token stays valid the whole time; only the Polar
+    /// gate's cached decision flips to DenyAll. We start with a GRANTED
+    /// license (claim succeeds), then flip the cache row and assert the route
+    /// is torn down well under the dead-man.
     #[tokio::test(start_paused = true)]
     async fn lapsed_entitlement_terminates_live_session() {
-        use crate::entitlement::{Entitlement, EntitlementCache, EntitlementGate, KeygatePolicy};
+        use crate::polar::test_support::{gate_with, seed_license, MockBackend};
         let (ctx, router, _auth, _uid) = fixture();
         const REVALIDATE_SECS: u64 = 10;
         ctx.set_token_revalidate_interval_secs(REVALIDATE_SECS);
 
-        // Active entitlement so the initial claim is granted.
-        let install_gate = |status: &str| {
-            let cache = EntitlementCache::open_in_memory().unwrap();
-            cache
-                .upsert(&Entitlement {
-                    external_ref: "mat".into(),
-                    customer_id: 1,
-                    max_tunnels: Some(5),
-                    status: status.into(),
-                    issued_at: 0,
-                    expires_at: i64::MAX,
-                    updated_at: 0,
-                })
-                .unwrap();
-            Arc::new(EntitlementGate::new(
-                cache,
-                KeygatePolicy {
-                    product: "ethertunnel".into(),
-                    public_key_b64: String::new(),
-                    key_id: "k1".into(),
-                    staleness_ceiling_secs: 0,
-                    require_entitlement: false,
-                },
-            ))
-        };
-        ctx.set_entitlements(install_gate("active"));
+        // Granted license so the initial claim is allowed.
+        let (gate, _reg, _rt) = gate_with(Arc::new(MockBackend::default()), &[]);
+        seed_license(&gate, "CMND-SEED", "mat", "granted", Some(5));
+        ctx.set_polar(gate.clone());
 
         let mut ctrl = connect(ctx.clone()).await;
         handshake(&mut ctrl, "etun_good").await;
@@ -1507,8 +1448,8 @@ mod tests {
             }
         });
 
-        // The customer cancels: swap in a SUSPENDED gate (cap_for -> DenyAll).
-        ctx.set_entitlements(install_gate("suspended"));
+        // The customer cancels: flip the cached decision (cap_for -> DenyAll).
+        seed_license(&gate, "CMND-SEED", "mat", "not_licensed", Some(5));
 
         // The next revalidation tick must tear the route down, bounded to 40s of
         // virtual time (>2 intervals, well below the 90s dead-man).
@@ -1527,6 +1468,85 @@ mod tests {
              ~2x the revalidate interval (well under the dead-man)"
         );
         let _ = tokio::time::timeout(Duration::from_secs(5), heartbeat).await;
+    }
+
+    /// End-to-end Polar auth: a session presenting a Polar license key (not a
+    /// local token) authenticates through the gate, is provisioned implicitly
+    /// in the registry under its customer id, activates, claims under its
+    /// benefit cap, and is denied past it. `ctx.auth` and the gate share the
+    /// SAME registry, exactly as in production.
+    #[tokio::test]
+    async fn polar_key_handshake_claims_under_cap() {
+        use crate::auth::Authenticator as _;
+        use crate::polar::test_support::{gate_with, MockBackend};
+        let backend = Arc::new(MockBackend::granting("CMND-E2E-KEY", "cust_e2e", "ben_cm"));
+        let (gate, registry, router) = gate_with(backend.clone(), &[("ben_cm", 1)]);
+        let ctx = SessionCtx::new(router.clone(), registry.clone(), "test-relay".into());
+        ctx.set_polar(gate);
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "CMND-E2E-KEY").await;
+
+        // First label: under the cap of 1 -> Granted, and the key activates.
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["cortex1.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
+        assert!(router.lookup_http("cortex1.ethertunnel.com").is_some());
+        let uid = registry
+            .lookup_user_id("cust_e2e")
+            .unwrap()
+            .expect("account provisioned implicitly from the Polar customer id");
+        assert!(registry.owns_hostname(uid, "cortex1.ethertunnel.com"));
+        assert_eq!(
+            backend
+                .activate_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "first claim must activate the key (device binding)"
+        );
+
+        // A second distinct label busts the 1-tunnel cap.
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["cortex2.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Denied { code, .. } => assert_eq!(code, DenyCode::LimitExceeded),
+            other => panic!("expected Denied(LimitExceeded), got {other:?}"),
+        }
+        assert!(!registry.owns_hostname(uid, "cortex2.ethertunnel.com"));
+    }
+
+    /// A key the backend does not grant is denied at the handshake, exactly
+    /// like a bad local token (no auth oracle distinguishing the two).
+    #[tokio::test]
+    async fn polar_unknown_key_is_denied_at_handshake() {
+        use crate::polar::test_support::{gate_with, MockBackend};
+        let (gate, registry, router) =
+            gate_with(Arc::new(MockBackend::default()), &[("ben_cm", 1)]);
+        let ctx = SessionCtx::new(router, registry, "test-relay".into());
+        ctx.set_polar(gate);
+
+        let mut ctrl = connect(ctx).await;
+        codec::write_preamble(&mut ctrl).await.unwrap();
+        send(&mut ctrl, hello("CMND-NOT-A-REAL-KEY")).await;
+        match recv(&mut ctrl).await {
+            ControlFrame::Denied { code, .. } => assert_eq!(code, DenyCode::AuthFailed),
+            other => panic!("expected Denied, got {other:?}"),
+        }
     }
 
     /// Happy path: a session whose token is NOT revoked survives multiple

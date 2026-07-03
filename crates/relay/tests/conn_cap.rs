@@ -59,9 +59,8 @@ fn relay_config(listen: SocketAddr) -> Arc<Config> {
         },
         registry: Default::default(),
         tcp: Default::default(),
-        keygate: None,
+        polar: None,
         limits: Default::default(),
-        provision: None,
     };
     config.limits.max_sessions = 2;
     config.limits.max_sessions_per_ip = 1;

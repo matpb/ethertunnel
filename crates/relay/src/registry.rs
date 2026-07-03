@@ -196,9 +196,9 @@ impl Registry {
             .unwrap_or(0)
     }
 
-    /// Resolve a user name (the keygate `external_ref`) to its registry user id,
-    /// or `Ok(None)` if no such user exists. Used by the entitlement reconcile
-    /// path, which is keyed by `external_ref` but prunes by `user_id`.
+    /// Resolve a user name (for Polar-provisioned accounts, the Polar
+    /// `customer_id`) to its registry user id, or `Ok(None)` if no such user
+    /// exists.
     pub fn lookup_user_id(&self, name: &str) -> Result<Option<i64>, RegistryError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT id FROM users WHERE name = ?1", [name], |r| r.get(0))
@@ -261,14 +261,11 @@ impl Registry {
 
     /// Provision (idempotently) a user by name and mint a fresh bearer token.
     ///
-    /// Used by the keygate-driven self-serve provisioning endpoint. The user is
-    /// created if absent (returning `created = true`) or reused if it already
-    /// exists (`created = false`); in both cases a *new* plaintext token is
-    /// minted and returned exactly once (matching `create_token` semantics).
-    ///
-    /// Idempotent on `users.name`: a webhook retry against an existing ref mints
-    /// an additional token rather than failing. keygate's `find_by_stripe_id`
-    /// short-circuit prevents that from happening for the same buyer in practice.
+    /// The user is created if absent (returning `created = true`) or reused if
+    /// it already exists (`created = false`); in both cases a *new* plaintext
+    /// token is minted and returned exactly once (matching `create_token`
+    /// semantics). Idempotent on `users.name`: a retry against an existing ref
+    /// mints an additional token rather than failing.
     pub fn provision_user_token(&self, name: &str) -> Result<(String, bool), RegistryError> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<i64> = conn
@@ -298,8 +295,8 @@ impl Registry {
     /// account — any token issued before now stops working immediately
     /// (`authenticate` matches `revoked_at IS NULL`).
     ///
-    /// Used by the keygate-driven self-serve *recovery* path, where the security
-    /// goal is that recovering an account kills any leaked/lost token. Contrast
+    /// An account-recovery primitive: the security goal is that recovering an
+    /// account kills any leaked/lost token. Contrast
     /// [`provision_user_token`], which *adds* a token and leaves old ones valid
     /// (correct for purchase-time provisioning).
     ///
@@ -347,8 +344,8 @@ impl Registry {
     /// their tokens are intentionally *kept*, so a resubscriber retains the same
     /// account/token; only the claimable namespace is reclaimed.
     ///
-    /// Returns `NoSuchUser` if `name` is unknown so the caller (the keygate
-    /// reaper) can treat that as already-released.
+    /// Returns `NoSuchUser` if `name` is unknown so a caller can treat that
+    /// as already-released.
     pub fn release_user_hostnames(
         &self,
         name: &str,
