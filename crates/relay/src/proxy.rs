@@ -511,7 +511,13 @@ fn scrub_request(
 }
 
 fn scrub_response(resp: &mut Response<hyper::body::Incoming>) {
-    strip_hop_by_hop(resp.headers_mut(), false);
+    // Preserve Connection/Upgrade on a 101 Switching Protocols, or the relayed
+    // WebSocket handshake is incomplete and browsers reject it with
+    // "Error during WebSocket handshake: 'Upgrade' header is missing" (close 1006).
+    // The request direction already keeps these (see the `upgrading` arg in the
+    // proxy); the response direction must match for the handshake to survive.
+    let is_upgrade = resp.status() == StatusCode::SWITCHING_PROTOCOLS;
+    strip_hop_by_hop(resp.headers_mut(), is_upgrade);
     // Don't advertise the stack.
     resp.headers_mut().remove("server");
 }
