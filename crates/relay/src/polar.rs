@@ -83,6 +83,16 @@ pub struct PolarPolicy {
     /// Honor a cached "granted" this long past its last successful
     /// validation if Polar is unreachable (fail-open window, seconds).
     pub staleness_secs: i64,
+    /// How long a key still counts toward its customer's pooled cap for the
+    /// purposes of the **destructive** downgrade prune. Deliberately much
+    /// longer than `staleness_secs`: the cache stores only key hashes, so a
+    /// key nobody presents can never be re-validated, and a daemon that is
+    /// merely offline is indistinguishable from a cancelled one. Denying new
+    /// claims on that evidence is reversible; hard-deleting globally-unique
+    /// labels is not. [`PolarGate::new`] clamps it up to `staleness_secs`, so
+    /// the prune can never be stricter than the gate that authorized the
+    /// claim.
+    pub cap_prune_grace_secs: i64,
     /// Enforce `limit_activations` by calling activate()/deactivate().
     pub activate_on_claim: bool,
     /// `benefit_id -> max_tunnels`: the relay's only source of capacity.
@@ -299,6 +309,18 @@ pub struct LicenseRow {
     pub validated_at: i64,
 }
 
+/// What cap resolution needs to know about a customer, in one query: how many
+/// keys the cache knows for them at all (zero = not a Polar customer, i.e. a
+/// local `etun admin` token) and the largest cap among the keys that still
+/// grant capacity (`None` = every known key is revoked, aged out, or on a
+/// benefit this relay has no cap mapping for). The two signals must stay
+/// apart: zero rows means Allow, rows-but-none-qualifying means DenyAll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustomerCap {
+    pub rows: i64,
+    pub max_tunnels: Option<i64>,
+}
+
 /// Local SQLite cache of validation results. Its own database file (sibling
 /// of the registry, 0600) so it never contends with the registry connection.
 pub struct LicenseCache {
@@ -353,21 +375,39 @@ impl LicenseCache {
         .optional()
     }
 
-    /// The freshest cached row for a customer, regardless of key. Backs
-    /// `cap_for`, which is keyed by the session's user name (= customer_id).
-    pub fn latest_for_customer(
+    /// Resolve a customer's cap across every key they hold. All of one
+    /// customer's keys collapse into ONE registry account and ONE tunnel
+    /// pool, so the answer is the MAX over the keys that still qualify —
+    /// granted, mapped to a cap, and validated at or after
+    /// `min_validated_at`. MAX and not SUM: buying N cheap licenses must not
+    /// stack into N times the capacity. The corollary is that any one of a
+    /// customer's keys authorizes the customer's maximum capacity; per-key
+    /// containment is `activate_on_claim` (device binding), not the cap.
+    ///
+    /// `min_validated_at` is the ONLY bound on an abandoned key's influence:
+    /// the cache holds key hashes, never plaintext, so the relay can never
+    /// re-validate a key nobody presents.
+    pub fn cap_for_customer(
         &self,
         customer_id: &str,
-    ) -> Result<Option<LicenseRow>, rusqlite::Error> {
+        min_validated_at: i64,
+    ) -> Result<CustomerCap, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT key_hash, customer_id, benefit_id, max_tunnels, status, activation_id, validated_at
-             FROM license_validation WHERE customer_id = ?1
-             ORDER BY validated_at DESC LIMIT 1",
-            [customer_id],
-            row_to_license,
+            "SELECT COUNT(*),
+                    MAX(CASE WHEN status = 'granted'
+                              AND max_tunnels IS NOT NULL
+                              AND validated_at >= ?2
+                             THEN max_tunnels END)
+             FROM license_validation WHERE customer_id = ?1",
+            rusqlite::params![customer_id, min_validated_at],
+            |r| {
+                Ok(CustomerCap {
+                    rows: r.get(0)?,
+                    max_tunnels: r.get(1)?,
+                })
+            },
         )
-        .optional()
     }
 
     /// Insert or refresh a validation result, preserving a stored
@@ -443,7 +483,23 @@ pub struct PolarGate {
 }
 
 impl PolarGate {
-    pub fn new(cache: LicenseCache, policy: PolarPolicy, backend: Box<dyn PolarBackend>) -> Self {
+    pub fn new(
+        cache: LicenseCache,
+        mut policy: PolarPolicy,
+        backend: Box<dyn PolarBackend>,
+    ) -> Self {
+        // The prune's window must contain the claim gate's, or the relay hard
+        // deletes labels its own gate would still authorize. Operators tune
+        // `staleness_secs`, so clamp instead of trusting the two defaults to
+        // stay ordered; a shorter grace is a misconfiguration, not a policy.
+        if policy.cap_prune_grace_secs < policy.staleness_secs {
+            tracing::warn!(
+                cap_prune_grace_secs = policy.cap_prune_grace_secs,
+                staleness_secs = policy.staleness_secs,
+                "[polar] cap_prune_grace_secs is shorter than staleness_secs; clamping up to it"
+            );
+            policy.cap_prune_grace_secs = policy.staleness_secs;
+        }
         Self {
             cache,
             policy,
@@ -513,13 +569,9 @@ impl PolarGate {
                 if let Err(e) = self.cache.upsert(&row) {
                     tracing::warn!(error = %e, "license cache upsert failed");
                 }
-                let cap = cap?; // unknown benefit -> deny
+                let cap = cap?; // this key's benefit is unmapped -> deny this key
                 let user = self.resolve_user(&rec, &customer_id)?;
-                // A re-validated key may carry a LOWER cap than before (tier
-                // switch issues a new key/benefit for the same customer, and
-                // idempotent re-claims bypass the claim-time cap). Prune
-                // over-cap owned rows now, oldest-N grandfathered.
-                self.reconcile_user_cap(&rec, user.user_id, &user.name, cap);
+                self.enforce_pooled_cap(&rec, &user, cap, now);
                 Some(user)
             }
             ValidateOutcome::NotLicensed => {
@@ -556,28 +608,44 @@ impl PolarGate {
     /// The effective cap for a session user. Polar-authed users (name =
     /// customer_id) resolve through the validation cache; anyone else — a
     /// local `etun admin` token — has no cache row and is uncapped
-    /// (`Allow`), exactly like the self-host path.
+    /// (`Allow`), exactly like the self-host path. A customer holding several
+    /// keys gets the MAX of their caps: the keys share one registry account,
+    /// so the cheapest one must not define the pool. The `ListOwned` advisory
+    /// therefore reports the shared pool's cap, which may exceed the plan the
+    /// presenting key belongs to — that is the number the relay enforces.
     pub fn cap_for(&self, user_name: &str, now: i64) -> CapDecision {
-        let row = match self.cache.latest_for_customer(user_name) {
-            Ok(Some(r)) => r,
-            Ok(None) => return CapDecision::Allow,
+        // A grant nobody could re-validate for the whole staleness window is
+        // no longer trustworthy. Live sessions re-validate every tick, so this
+        // only bites when Polar has been unreachable for days.
+        self.resolve_cap(user_name, now.saturating_sub(self.policy.staleness_secs))
+    }
+
+    /// Pooled cap for a customer, counting only keys validated at or after
+    /// `min_validated_at`. Callers pick that cutoff by what their decision
+    /// costs when it is wrong: [`cap_for`](Self::cap_for) and the route
+    /// eviction in [`enforce_pooled_cap`](Self::enforce_pooled_cap) use
+    /// `staleness_secs`, the hard delete a much longer grace.
+    ///
+    /// The cutoff is deliberately absolute. Qualifying rows by freshness
+    /// *relative* to the customer's newest key would drop a legitimately
+    /// offline daemon (laptop shut overnight) out of the MAX and re-create the
+    /// very bug this resolution exists to fix.
+    fn resolve_cap(&self, customer_id: &str, min_validated_at: i64) -> CapDecision {
+        let resolved = match self.cache.cap_for_customer(customer_id, min_validated_at) {
+            Ok(r) => r,
             Err(e) => {
-                tracing::warn!(user_name, error = %e, "license cache read failed; allowing");
+                tracing::warn!(customer_id, error = %e, "license cache read failed; allowing");
                 return CapDecision::Allow;
             }
         };
-        if row.status != "granted" {
-            return CapDecision::DenyAll;
+        if resolved.rows == 0 {
+            return CapDecision::Allow;
         }
-        if now > row.validated_at + self.policy.staleness_secs {
-            // A grant nobody could re-validate for the whole staleness window
-            // is no longer trustworthy. Live sessions re-validate every tick,
-            // so this only bites when Polar has been unreachable for days.
-            return CapDecision::DenyAll;
-        }
-        match row.max_tunnels {
+        match resolved.max_tunnels {
             Some(m) => CapDecision::Cap(m),
-            None => CapDecision::DenyAll, // benefit missing from [polar.benefits]
+            // Keys exist but none qualify: revoked, aged past the cutoff, or
+            // on a benefit missing from [polar.benefits].
+            None => CapDecision::DenyAll,
         }
     }
 
@@ -644,6 +712,39 @@ impl PolarGate {
         }
     }
 
+    /// Bring a customer's shared pool back in line with what their keys still
+    /// buy, on the key that just re-validated. Two windows, because the two
+    /// actions cost differently when the evidence is wrong: an abandoned key
+    /// stops backing LIVE traffic after `staleness_secs` — the same window the
+    /// claim gate uses, so the relay never routes what it would refuse to
+    /// claim — while its hostname *reservations* survive until
+    /// `cap_prune_grace_secs`, because releasing a globally-unique label back
+    /// into a first-come-first-served pool is the one step nobody can undo.
+    ///
+    /// `cap` is the just-validated key's own cap, a floor under both windows:
+    /// a failed upsert would otherwise leave its row out of the aggregate and
+    /// tear down tunnels it pays for.
+    fn enforce_pooled_cap(&self, rec: &Reconciler, user: &AuthedUser, cap: i64, now: i64) {
+        let pooled_over = |window: i64| self.resolve_cap(&user.name, now.saturating_sub(window));
+        // A non-`Cap` decision here means the cache could not answer — the
+        // upsert above failed, or the read did. A broken cache must never tear
+        // anything down, least of all to zero.
+        if let CapDecision::Cap(pooled) = pooled_over(self.policy.cap_prune_grace_secs) {
+            if pooled > cap {
+                tracing::info!(
+                    customer_id = %user.name,
+                    key_cap = cap,
+                    pooled,
+                    "cap pooled from a sibling key on the same customer"
+                );
+            }
+            self.reconcile_user_cap(rec, user.user_id, &user.name, pooled.max(cap));
+        }
+        if let CapDecision::Cap(live) = pooled_over(self.policy.staleness_secs) {
+            self.evict_over_cap(rec, user.user_id, &user.name, live.max(cap));
+        }
+    }
+
     /// Prune a user's owned resources down to `cap` and tear down the routes
     /// of anything pruned (oldest-N grandfathered, newest dropped) — the
     /// same downgrade semantics the keygate reconciler had.
@@ -659,23 +760,58 @@ impl PolarGate {
             return;
         }
         let pruned = labels.len() + ports.len();
-        let fqdns: Vec<String> = labels
-            .iter()
-            .map(|label| format!("{label}.{}", rec.domain))
-            .collect();
-        let evicted = rec.router.evict_routes(&fqdns, &ports);
-        for (handle, resource) in evicted {
-            handle.send_ctrl(ethertunnel_proto::frames::ControlFrame::Denied {
-                code: ethertunnel_proto::frames::DenyCode::LimitExceeded,
-                message: format!("tunnel {resource:?} pruned: plan change reduced your limit"),
-            });
-        }
+        Self::tear_down_routes(rec, &labels, &ports);
         tracing::info!(
             user_name,
             cap,
             pruned,
             "plan downgrade: pruned over-cap tunnels"
         );
+    }
+
+    /// Stop the traffic on a user's resources past `cap` while leaving the
+    /// reservations intact. The daemon is told why; a reconnect re-claims and
+    /// is refused by the same cap, so nothing silently comes back.
+    fn evict_over_cap(&self, rec: &Reconciler, user_id: i64, user_name: &str, cap: i64) {
+        let (labels, ports) = match rec.registry.owned_over_cap(user_id, cap) {
+            Ok(over) => over,
+            Err(e) => {
+                tracing::warn!(user_name, error = %e, "over-cap route lookup failed");
+                return;
+            }
+        };
+        if labels.is_empty() && ports.is_empty() {
+            return;
+        }
+        let evicted = Self::tear_down_routes(rec, &labels, &ports);
+        if evicted > 0 {
+            tracing::info!(
+                user_name,
+                cap,
+                evicted,
+                "plan downgrade: evicted over-cap routes (reservations kept)"
+            );
+        }
+    }
+
+    /// Drop the routes for `labels`/`ports` and tell whoever was serving them
+    /// why. Returns how many live routes were actually torn down.
+    fn tear_down_routes(rec: &Reconciler, labels: &[String], ports: &[u16]) -> usize {
+        let fqdns: Vec<String> = labels
+            .iter()
+            .map(|label| format!("{label}.{}", rec.domain))
+            .collect();
+        let evicted = rec.router.evict_routes(&fqdns, ports);
+        let count = evicted.len();
+        for (handle, resource) in evicted {
+            handle.send_ctrl(ethertunnel_proto::frames::ControlFrame::Denied {
+                code: ethertunnel_proto::frames::DenyCode::LimitExceeded,
+                // "stopped", not "pruned": the eviction caller keeps the
+                // reservation, so the label may well still be theirs.
+                message: format!("tunnel {resource:?} stopped: plan change reduced your limit"),
+            });
+        }
+        count
     }
 
     /// Upsert-and-resolve the registry account for a Polar customer. The
@@ -753,6 +889,16 @@ pub(crate) mod test_support {
                 ..Default::default()
             }
         }
+
+        /// Add another granted key: one customer can hold several keys on
+        /// different benefits.
+        pub fn grant(mut self, key: &str, customer_id: &str, benefit_id: &str) -> Self {
+            self.granted.insert(
+                key.to_owned(),
+                (customer_id.to_owned(), benefit_id.to_owned()),
+            );
+            self
+        }
     }
 
     /// Tests hold an `Arc<MockBackend>` to read the call counters after the
@@ -809,6 +955,19 @@ pub(crate) mod test_support {
         status: &str,
         max_tunnels: Option<i64>,
     ) {
+        seed_license_at(gate, key, customer_id, status, max_tunnels, now_unix());
+    }
+
+    /// [`seed_license`] with an explicit `validated_at`, so a test can age a
+    /// row past `cache_ttl_secs`, `staleness_secs`, or `cap_prune_grace_secs`.
+    pub fn seed_license_at(
+        gate: &PolarGate,
+        key: &str,
+        customer_id: &str,
+        status: &str,
+        max_tunnels: Option<i64>,
+        validated_at: i64,
+    ) {
         gate.cache
             .upsert(&LicenseRow {
                 key_hash: hash_key(key),
@@ -817,9 +976,22 @@ pub(crate) mod test_support {
                 max_tunnels,
                 status: status.to_owned(),
                 activation_id: None,
-                validated_at: now_unix(),
+                validated_at,
             })
             .unwrap();
+    }
+
+    /// The shipped defaults, as a policy a test can mutate to model a
+    /// misconfigured relay.
+    pub fn test_policy(benefits: &[(&str, i64)]) -> PolarPolicy {
+        PolarPolicy {
+            organization_id: "org-test".into(),
+            cache_ttl_secs: 300,
+            staleness_secs: 259_200,
+            cap_prune_grace_secs: 2_592_000,
+            activate_on_claim: true,
+            benefits: benefits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        }
     }
 
     /// A gate wired to an in-memory cache/registry/router, returning the
@@ -833,17 +1005,22 @@ pub(crate) mod test_support {
         std::sync::Arc<crate::registry::Registry>,
         std::sync::Arc<crate::router::Router>,
     ) {
+        gate_with_policy(backend, test_policy(benefits))
+    }
+
+    /// [`gate_with`] with an explicit policy.
+    pub fn gate_with_policy(
+        backend: std::sync::Arc<MockBackend>,
+        policy: PolarPolicy,
+    ) -> (
+        std::sync::Arc<PolarGate>,
+        std::sync::Arc<crate::registry::Registry>,
+        std::sync::Arc<crate::router::Router>,
+    ) {
         let registry = std::sync::Arc::new(
             crate::registry::Registry::open_in_memory("ethertunnel.com").unwrap(),
         );
         let router = std::sync::Arc::new(crate::router::Router::new());
-        let policy = PolarPolicy {
-            organization_id: "org-test".into(),
-            cache_ttl_secs: 300,
-            staleness_secs: 259_200,
-            activate_on_claim: true,
-            benefits: benefits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-        };
         let gate = PolarGate::new(
             LicenseCache::open_in_memory().unwrap(),
             policy,
@@ -860,10 +1037,14 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{gate_with, MockBackend};
+    use super::test_support::{
+        gate_with, gate_with_policy, seed_license, seed_license_at, test_policy, MockBackend,
+    };
     use super::*;
+    use ethertunnel_proto::frames::{ControlFrame, DenyCode};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     const KEY: &str = "CMND-TEST-KEY-0001";
 
@@ -1058,6 +1239,9 @@ mod tests {
         assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 3);
 
         // The tier switch: same customer, new key on the 1-cap benefit.
+        // gate2's cache is FRESH, so it holds no row for the old key — this
+        // models a relay that has never seen it, not the shared-cache case.
+        // That one is `genuine_downgrade_prunes_once_the_old_key_goes_stale`.
         let new_key = "CMND-NEW-KEY";
         let (gate2, _r, _rt) = gate_with(
             Arc::new(MockBackend::granting(new_key, "cust_1", "ben_cm")),
@@ -1078,6 +1262,331 @@ mod tests {
         // Owned rows were pruned to the new cap (oldest kept).
         assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 1);
         assert!(registry.owns_hostname(user.user_id, "a.ethertunnel.com"));
+    }
+
+    /// Age `key`'s cached row past `cache_ttl_secs` and authenticate it, so
+    /// the fresh-cache early return is skipped and the prune actually runs.
+    async fn revalidate(gate: &PolarGate, key: &str) {
+        let mut row = gate.cache.get(&hash_key(key)).unwrap().unwrap();
+        row.validated_at = now_unix() - gate.policy.cache_ttl_secs - 1;
+        gate.cache.upsert(&row).unwrap();
+        gate.authenticate(key).await.expect("re-validate");
+    }
+
+    /// A live session handle plus the receiver its `Denied` frames land in.
+    fn session_handle(
+        user_id: i64,
+    ) -> (crate::router::SessionHandle, mpsc::Receiver<ControlFrame>) {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        (
+            crate::router::SessionHandle::new(1, user_id, ctrl_tx, cmd_tx),
+            ctrl_rx,
+        )
+    }
+
+    /// One Polar customer, two granted keys, one shared registry account:
+    /// re-validating the smallest key must not shrink the pool the biggest
+    /// one pays for. Another customer's keys stay out of it.
+    #[tokio::test]
+    async fn multi_key_customer_resolves_cap_as_max_across_keys() {
+        const TEAM: &str = "CMND-TEAM-KEY";
+        const CM: &str = "CMND-CORTEXMIND-KEY";
+        let backend = Arc::new(
+            MockBackend::granting(TEAM, "cust_1", "ben_team").grant(CM, "cust_1", "ben_cm"),
+        );
+        let (gate, registry, _router) = gate_with(backend, &[("ben_team", 30), ("ben_cm", 1)]);
+
+        let user = gate.authenticate(TEAM).await.expect("team key");
+        for label in ["a", "b", "c"] {
+            registry.claim_label(user.user_id, label).unwrap();
+        }
+
+        let same = gate.authenticate(CM).await.expect("cortexmind key");
+        assert_eq!(same.user_id, user.user_id);
+
+        assert_eq!(
+            registry.count_owned_resources(user.user_id).unwrap(),
+            3,
+            "the 1-tunnel key must not prune what the 30-tunnel key allows"
+        );
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(30));
+
+        seed_license(&gate, "K-OTHER", "cust_2", "granted", Some(99));
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(30));
+        assert_eq!(gate.cap_for("cust_2", now_unix()), CapDecision::Cap(99));
+        assert_eq!(
+            gate.cap_for("mat", now_unix()),
+            CapDecision::Allow,
+            "a local token must stay uncapped however many customers the cache holds"
+        );
+    }
+
+    /// The pooled cap is the number the prune ENFORCES, not merely a reason
+    /// not to prune: 40 owned against a pooled 30 lands on 30, not on the
+    /// presenting key's 1 and not untouched.
+    #[tokio::test]
+    async fn pooled_cap_is_the_enforced_prune_target() {
+        const TEAM: &str = "CMND-TEAM-KEY";
+        const CM: &str = "CMND-CORTEXMIND-KEY";
+        let backend = Arc::new(
+            MockBackend::granting(TEAM, "cust_1", "ben_team").grant(CM, "cust_1", "ben_cm"),
+        );
+        let (gate, registry, _router) = gate_with(backend, &[("ben_team", 30), ("ben_cm", 1)]);
+
+        let user = gate.authenticate(TEAM).await.expect("team key");
+        for i in 0..40 {
+            registry
+                .claim_label(user.user_id, &format!("h{i:02}"))
+                .unwrap();
+        }
+
+        gate.authenticate(CM).await.expect("cortexmind key");
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 30);
+        assert!(registry.owns_hostname(user.user_id, "h00.ethertunnel.com"));
+        assert!(!registry.owns_hostname(user.user_id, "h39.ethertunnel.com"));
+    }
+
+    /// Enforcement splits by what it costs to be wrong: an abandoned sibling
+    /// key stops backing LIVE traffic on the claim gate's window, while the
+    /// hostname reservations it grandfathers survive to the far longer prune
+    /// grace. Routing what the gate would refuse to claim is the regression.
+    #[tokio::test]
+    async fn stale_sibling_key_evicts_routes_but_keeps_reservations() {
+        const OLD: &str = "CMND-OLD-INDIE-KEY";
+        const NEW: &str = "CMND-NEW-CM-KEY";
+        let backend = Arc::new(
+            MockBackend::granting(OLD, "cust_1", "ben_indie").grant(NEW, "cust_1", "ben_cm"),
+        );
+        let (gate, registry, router) = gate_with(backend, &[("ben_indie", 3), ("ben_cm", 1)]);
+
+        let user = gate.authenticate(OLD).await.expect("old key");
+        let (handle, mut denied) = session_handle(user.user_id);
+        let fqdns: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|l| {
+                registry.claim_label(user.user_id, l).unwrap();
+                format!("{l}.ethertunnel.com")
+            })
+            .collect();
+        router.claim(&handle, &fqdns, &[]);
+
+        // Both keys still presented: nothing moves.
+        gate.authenticate(NEW).await.expect("new key");
+        assert!(router.lookup_http("c.ethertunnel.com").is_some());
+
+        // The old key is never presented again. Past the staleness window the
+        // claim gate stops counting it, so its traffic stops with it.
+        let past_staleness = now_unix() - gate.policy.staleness_secs - 1;
+        seed_license_at(&gate, OLD, "cust_1", "granted", Some(3), past_staleness);
+        revalidate(&gate, NEW).await;
+        assert!(router.lookup_http("a.ethertunnel.com").is_some());
+        assert!(router.lookup_http("b.ethertunnel.com").is_none());
+        assert!(router.lookup_http("c.ethertunnel.com").is_none());
+        assert!(matches!(
+            denied.try_recv(),
+            Ok(ControlFrame::Denied {
+                code: DenyCode::LimitExceeded,
+                ..
+            })
+        ));
+
+        // The reservations are still theirs until the prune grace runs out.
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 3);
+    }
+
+    /// An operator who shortens the prune grace below the fail-open window
+    /// must not get a prune stricter than the claim gate — that hard-deletes,
+    /// every revalidation, exactly the labels the gate just authorized.
+    #[tokio::test]
+    async fn short_cap_prune_grace_cannot_outrun_the_claim_gate() {
+        const OLD: &str = "CMND-OLD-INDIE-KEY";
+        const NEW: &str = "CMND-NEW-CM-KEY";
+        let backend = Arc::new(
+            MockBackend::granting(OLD, "cust_1", "ben_indie").grant(NEW, "cust_1", "ben_cm"),
+        );
+        let mut policy = test_policy(&[("ben_indie", 3), ("ben_cm", 1)]);
+        policy.cap_prune_grace_secs = 86_400;
+        let (gate, registry, _router) = gate_with_policy(backend, policy);
+
+        let user = gate.authenticate(OLD).await.expect("old key");
+        for label in ["a", "b", "c"] {
+            registry.claim_label(user.user_id, label).unwrap();
+        }
+        gate.authenticate(NEW).await.expect("new key");
+
+        // Two days stale: inside the window the claim gate honors, outside the
+        // grace the operator asked for.
+        seed_license_at(
+            &gate,
+            OLD,
+            "cust_1",
+            "granted",
+            Some(3),
+            now_unix() - 172_800,
+        );
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(3));
+
+        revalidate(&gate, NEW).await;
+        assert_eq!(
+            registry.count_owned_resources(user.user_id).unwrap(),
+            3,
+            "the prune deleted labels the claim gate still authorizes"
+        );
+    }
+
+    /// The MAX must not grandfather a plan the customer no longer holds — but
+    /// silence is weak evidence: the claim gate stops counting an abandoned
+    /// key after `staleness_secs` (reversible), while the hard delete waits
+    /// for the far longer `cap_prune_grace_secs`.
+    #[tokio::test]
+    async fn genuine_downgrade_prunes_once_the_old_key_goes_stale() {
+        const OLD: &str = "CMND-OLD-INDIE-KEY";
+        const NEW: &str = "CMND-NEW-CM-KEY";
+        let backend = Arc::new(
+            MockBackend::granting(OLD, "cust_1", "ben_indie").grant(NEW, "cust_1", "ben_cm"),
+        );
+        let (gate, registry, _router) = gate_with(backend, &[("ben_indie", 3), ("ben_cm", 1)]);
+
+        let user = gate.authenticate(OLD).await.expect("old key");
+        for label in ["a", "b", "c"] {
+            registry.claim_label(user.user_id, label).unwrap();
+        }
+
+        gate.authenticate(NEW).await.expect("new key");
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 3);
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(3));
+
+        // The old key is never presented again. Past the staleness window the
+        // claim gate stops counting it...
+        let past_staleness = now_unix() - gate.policy.staleness_secs - 1;
+        seed_license_at(&gate, OLD, "cust_1", "granted", Some(3), past_staleness);
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(1));
+
+        // ...but the prune does not: a daemon merely offline for three days
+        // must not lose its hostname reservations.
+        revalidate(&gate, NEW).await;
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 3);
+
+        // Past the prune grace the old plan is gone for real.
+        let past_grace = now_unix() - gate.policy.cap_prune_grace_secs - 1;
+        seed_license_at(&gate, OLD, "cust_1", "granted", Some(3), past_grace);
+        revalidate(&gate, NEW).await;
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 1);
+        assert!(registry.owns_hostname(user.user_id, "a.ethertunnel.com"));
+    }
+
+    /// The one downgrade shape that still enforces promptly: the same key
+    /// returns on a smaller benefit, overwriting its own row, so the old cap
+    /// leaves the pool the moment it re-validates.
+    #[tokio::test]
+    async fn same_key_benefit_change_prunes_immediately() {
+        let (gate, registry, _router) = gate_with(
+            Arc::new(MockBackend::granting(KEY, "cust_1", "ben_cm")),
+            &[("ben_cm", 1)],
+        );
+        let user = gate.authenticate(KEY).await.expect("provision");
+        for label in ["a", "b", "c"] {
+            registry.claim_label(user.user_id, label).unwrap();
+        }
+
+        // Pre-switch state: this key's row still carries the old 3-tunnel cap,
+        // aged past the TTL so the next authenticate re-validates.
+        let ttl_expired = now_unix() - gate.policy.cache_ttl_secs - 1;
+        seed_license_at(&gate, KEY, "cust_1", "granted", Some(3), ttl_expired);
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(3));
+
+        gate.authenticate(KEY).await.expect("re-validate");
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 1);
+        assert!(registry.owns_hostname(user.user_id, "a.ethertunnel.com"));
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(1));
+    }
+
+    #[tokio::test]
+    async fn cap_ignores_keys_past_the_staleness_window() {
+        let (gate, _registry, _router) = gate_with(Arc::new(MockBackend::default()), &[]);
+        let now = now_unix();
+        let staleness = gate.policy.staleness_secs;
+
+        seed_license_at(&gate, "K-SMALL", "cust_1", "granted", Some(1), now);
+        seed_license_at(
+            &gate,
+            "K-BIG",
+            "cust_1",
+            "granted",
+            Some(30),
+            now - staleness - 1,
+        );
+        assert_eq!(gate.cap_for("cust_1", now), CapDecision::Cap(1));
+
+        // The window edge is inclusive.
+        seed_license_at(
+            &gate,
+            "K-BIG",
+            "cust_1",
+            "granted",
+            Some(30),
+            now - staleness,
+        );
+        assert_eq!(gate.cap_for("cust_1", now), CapDecision::Cap(30));
+    }
+
+    /// Aging out is a third way to have rows and no capacity, and it must land
+    /// on `DenyAll` like the other two. Qualifying rows by freshness in the
+    /// aggregate's WHERE clause instead of its CASE would zero the row count
+    /// and fail open to `Allow` — an uncapped lapsed customer.
+    #[tokio::test]
+    async fn a_customer_whose_only_key_aged_out_is_denied_not_uncapped() {
+        let (gate, _registry, _router) = gate_with(Arc::new(MockBackend::default()), &[]);
+        let now = now_unix();
+        seed_license_at(
+            &gate,
+            "K-LAPSED",
+            "cust_1",
+            "granted",
+            Some(30),
+            now - gate.policy.staleness_secs - 1,
+        );
+        assert_eq!(gate.cap_for("cust_1", now), CapDecision::DenyAll);
+        assert_eq!(gate.cap_for("mat", now), CapDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn revoked_and_unmapped_keys_grant_no_capacity() {
+        let (gate, _registry, _router) = gate_with(Arc::new(MockBackend::default()), &[]);
+        let now = now_unix();
+
+        seed_license(&gate, "K-REVOKED", "cust_1", "not_licensed", Some(30));
+        seed_license(&gate, "K-UNMAPPED", "cust_1", "granted", None);
+        assert_eq!(
+            gate.cap_for("cust_1", now),
+            CapDecision::DenyAll,
+            "keys exist but none qualify — must deny, never fall through to Allow"
+        );
+
+        seed_license(&gate, "K-LIVE", "cust_1", "granted", Some(2));
+        assert_eq!(gate.cap_for("cust_1", now), CapDecision::Cap(2));
+    }
+
+    #[tokio::test]
+    async fn unmapped_benefit_denies_its_own_key_without_touching_the_pool() {
+        const GOOD: &str = "CMND-GOOD-KEY";
+        const BAD: &str = "CMND-UNMAPPED-KEY";
+        let backend = Arc::new(MockBackend::granting(GOOD, "cust_1", "ben_cm").grant(
+            BAD,
+            "cust_1",
+            "ben_unknown",
+        ));
+        let (gate, registry, _router) = gate_with(backend, &[("ben_cm", 5)]);
+
+        let user = gate.authenticate(GOOD).await.expect("mapped key");
+        for label in ["a", "b"] {
+            registry.claim_label(user.user_id, label).unwrap();
+        }
+
+        assert!(gate.authenticate(BAD).await.is_none());
+        assert_eq!(registry.count_owned_resources(user.user_id).unwrap(), 2);
+        assert_eq!(gate.cap_for("cust_1", now_unix()), CapDecision::Cap(5));
     }
 
     /// On-disk license cache (+ WAL/SHM) must be 0600 — it maps key hashes

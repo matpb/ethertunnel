@@ -71,6 +71,14 @@ port_range = [20000, 20999]
 # # Honor a cached "granted" this long past its last successful validation if
 # # Polar is unreachable (bounded fail-open window, seconds).
 # staleness_secs = 259200
+# # How long a key a customer has stopped presenting still counts toward that
+# # customer's pooled tunnel cap, for the DESTRUCTIVE downgrade prune only
+# # (seconds). Deleting a globally-unique hostname reservation cannot be undone,
+# # so it waits far longer than staleness_secs above; live traffic over the cap
+# # already stops at staleness_secs. Values below staleness_secs are clamped up
+# # to it — a prune stricter than the claim gate would delete what it just
+# # authorized.
+# cap_prune_grace_secs = 2592000
 # # Enforce limit_activations (device binding) via Polar activate()/deactivate().
 # activate_on_claim = true
 #

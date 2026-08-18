@@ -145,6 +145,15 @@ pub struct PolarConfig {
     /// validation when Polar is unreachable (bounded fail-open window).
     #[serde(default = "default_polar_staleness_secs")]
     pub staleness_secs: i64,
+    /// How long a key still counts toward its customer's pooled cap for the
+    /// **destructive** downgrade prune. Much longer than `staleness_secs`
+    /// because the relay cannot re-validate a key nobody presents, so a
+    /// merely-offline daemon looks exactly like a cancelled one — and the
+    /// prune hard-deletes globally-unique labels. Clamped up to
+    /// `staleness_secs` at startup: a shorter grace would let the prune
+    /// destroy what the claim gate still authorizes.
+    #[serde(default = "default_polar_cap_prune_grace_secs")]
+    pub cap_prune_grace_secs: i64,
     /// Enforce `limit_activations` (device binding) by calling Polar
     /// activate()/deactivate() around claim/release.
     #[serde(default = "default_polar_activate_on_claim")]
@@ -167,6 +176,10 @@ fn default_polar_cache_ttl_secs() -> i64 {
 
 fn default_polar_staleness_secs() -> i64 {
     259_200 // 3 days
+}
+
+fn default_polar_cap_prune_grace_secs() -> i64 {
+    2_592_000 // 30 days
 }
 
 fn default_polar_activate_on_claim() -> bool {
@@ -435,6 +448,7 @@ mod tests {
         assert_eq!(p.api_base, "https://api.polar.sh");
         assert_eq!(p.cache_ttl_secs, 300);
         assert_eq!(p.staleness_secs, 259_200);
+        assert_eq!(p.cap_prune_grace_secs, 2_592_000);
         assert!(p.activate_on_claim);
         assert_eq!(
             p.benefits.get("11111111-1111-1111-1111-111111111111"),
