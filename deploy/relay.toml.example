@@ -59,6 +59,13 @@ port_range = [20000, 20999]
 # provisioned implicitly under the Polar customer id, and the per-plan tunnel
 # cap comes from the [polar.benefits] map below. Local admin tokens keep
 # working alongside (they are checked first, with no network call).
+#
+# One Polar customer is ONE relay account with ONE tunnel pool, however many
+# keys they hold. That pool's cap is the MAX over their keys, not the cap of
+# whichever key happened to authenticate last — someone who owns both a Team
+# key and a single-tunnel product key gets Team's capacity, and the small key
+# can never evict what the big one pays for. MAX and not SUM, so buying N
+# cheap licenses does not stack into N times the capacity.
 # [polar]
 # # Your Polar organization id (public identifier, but operator-supplied —
 # # fill in your own; never commit a real value to a repo).

@@ -67,6 +67,11 @@ closed.
 
 Keep `staging = true` in `[tls.acme]` for the first boot.
 
+The `[polar]` block is optional and commented out in the example. Leave it out
+for a token-only relay; uncomment it to also accept Polar license keys as
+credentials, with per-plan tunnel caps. The example file documents every knob,
+including how a customer's cap pools across all the keys they hold.
+
 ## 4. Service
 
     cp deploy/etun-relay.service /etc/systemd/system/etun-relay.service
