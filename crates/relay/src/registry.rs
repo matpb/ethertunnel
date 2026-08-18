@@ -546,8 +546,38 @@ impl Registry {
         user_id: i64,
         cap: i64,
     ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
-        let cap = cap.max(0);
         let conn = self.conn.lock().unwrap();
+        let (removed_hosts, removed_ports) = Self::over_cap(&conn, user_id, cap)?;
+        for label in &removed_hosts {
+            conn.execute("DELETE FROM hostnames WHERE label = ?1", [label])?;
+        }
+        for &port in &removed_ports {
+            conn.execute("DELETE FROM tcp_ports WHERE port = ?1", [port as i64])?;
+        }
+        Ok((removed_hosts, removed_ports))
+    }
+
+    /// The exact set [`prune_owned_to_cap`](Self::prune_owned_to_cap) would
+    /// delete, without deleting it — the routes to tear down when enforcement
+    /// must stop live traffic while the reservation itself is not yet forfeit.
+    pub fn owned_over_cap(
+        &self,
+        user_id: i64,
+        cap: i64,
+    ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
+        let conn = self.conn.lock().unwrap();
+        Self::over_cap(&conn, user_id, cap)
+    }
+
+    /// The owned resources past `cap`, oldest grandfathered. Callers hold the
+    /// connection mutex, so a prune's read and its deletes stay atomic against
+    /// any concurrent claim.
+    fn over_cap(
+        conn: &Connection,
+        user_id: i64,
+        cap: i64,
+    ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
+        let cap = cap.max(0);
         // Build the unified owned set, oldest first. `kind` (0 = host, 1 = port)
         // only breaks created_at ties deterministically; it is not a priority.
         #[derive(Debug)]
@@ -582,27 +612,21 @@ impl Registry {
             }
         }
         // Oldest first: created_at asc, then the stable key asc. Everything at
-        // index >= cap is "newest over cap" and gets pruned.
+        // index >= cap is "newest over cap".
         owned.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         let cap = cap as usize;
         if owned.len() <= cap {
             return Ok((Vec::new(), Vec::new()));
         }
-        let mut removed_hosts = Vec::new();
-        let mut removed_ports = Vec::new();
+        let mut hosts = Vec::new();
+        let mut ports = Vec::new();
         for (_, _, res) in owned.into_iter().skip(cap) {
             match res {
-                Owned::Host(label) => {
-                    conn.execute("DELETE FROM hostnames WHERE label = ?1", [&label])?;
-                    removed_hosts.push(label);
-                }
-                Owned::Port(port) => {
-                    conn.execute("DELETE FROM tcp_ports WHERE port = ?1", [port as i64])?;
-                    removed_ports.push(port);
-                }
+                Owned::Host(label) => hosts.push(label),
+                Owned::Port(port) => ports.push(port),
             }
         }
-        Ok((removed_hosts, removed_ports))
+        Ok((hosts, ports))
     }
 
     /// Create a token for a user, returning the plaintext (shown once).
@@ -1194,6 +1218,35 @@ mod tests {
         let (h3, p3) = r.prune_owned_to_cap(mat, 0).unwrap();
         assert_eq!(h3.len() + p3.len(), 2);
         assert_eq!(r.count_owned_resources(mat).unwrap(), 0);
+    }
+
+    #[test]
+    fn owned_over_cap_names_the_same_set_without_deleting_it() {
+        let r = reg();
+        let mat = r.add_user("mat").unwrap();
+        {
+            let conn = r.conn.lock().unwrap();
+            for (label, ts) in [("oldest", 100), ("middle", 200), ("newest", 300)] {
+                conn.execute(
+                    "INSERT INTO hostnames (user_id, label, created_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![mat, label, ts],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO tcp_ports (port, user_id, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![20500i64, mat, 250i64],
+            )
+            .unwrap();
+        }
+
+        let (hosts, ports) = r.owned_over_cap(mat, 2).unwrap();
+        assert_eq!(hosts, vec!["newest".to_string()]);
+        assert_eq!(ports, vec![20500]);
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 4);
+
+        assert_eq!(r.prune_owned_to_cap(mat, 2).unwrap(), (hosts, ports));
+        assert!(r.owned_over_cap(mat, 2).unwrap().0.is_empty());
     }
 
     #[test]

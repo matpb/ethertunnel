@@ -398,6 +398,7 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
             organization_id: po.organization_id.clone(),
             cache_ttl_secs: po.cache_ttl_secs,
             staleness_secs: po.staleness_secs,
+            cap_prune_grace_secs: po.cap_prune_grace_secs,
             activate_on_claim: po.activate_on_claim,
             benefits: po.benefits.clone(),
         };
@@ -415,6 +416,7 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
             api_base = %po.api_base,
             cache_ttl_secs = po.cache_ttl_secs,
             staleness_secs = po.staleness_secs,
+            cap_prune_grace_secs = po.cap_prune_grace_secs,
             activate_on_claim = po.activate_on_claim,
             benefits = po.benefits.len(),
             "polar license auth enabled"

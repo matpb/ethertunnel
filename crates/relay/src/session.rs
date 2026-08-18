@@ -1530,6 +1530,63 @@ mod tests {
         assert!(!registry.owns_hostname(uid, "cortex2.ethertunnel.com"));
     }
 
+    /// A customer holding a big key and a small key keeps the tunnels the big
+    /// key pays for, and can still claim more, even after the small key
+    /// re-validates on its own connection.
+    #[tokio::test]
+    async fn second_key_revalidation_neither_prunes_nor_blocks_claims() {
+        use crate::polar::test_support::{gate_with, MockBackend};
+        const TEAM: &str = "CMND-TEAM-E2E";
+        const CM: &str = "CMND-CM-E2E";
+        let backend = Arc::new(MockBackend::granting(TEAM, "cust_multi", "ben_team").grant(
+            CM,
+            "cust_multi",
+            "ben_cm",
+        ));
+        let (gate, registry, router) = gate_with(backend, &[("ben_team", 30), ("ben_cm", 1)]);
+        let ctx = SessionCtx::new(router.clone(), registry.clone(), "test-relay".into());
+        ctx.set_polar(gate.clone());
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, TEAM).await;
+        for host in ["t1.ethertunnel.com", "t2.ethertunnel.com"] {
+            send(
+                &mut ctrl,
+                ControlFrame::Claim {
+                    hostnames: vec![host.into()],
+                    tcp_ports: vec![],
+                },
+            )
+            .await;
+            assert!(matches!(
+                recv(&mut ctrl).await,
+                ControlFrame::Granted { .. }
+            ));
+        }
+
+        // The CortexMind daemon re-validates its own 1-tunnel key.
+        gate.authenticate(CM)
+            .await
+            .expect("second key authenticates");
+
+        assert!(router.lookup_http("t2.ethertunnel.com").is_some());
+        let uid = registry.lookup_user_id("cust_multi").unwrap().unwrap();
+        assert_eq!(registry.count_owned_resources(uid).unwrap(), 2);
+
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["t3.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
+    }
+
     /// A key the backend does not grant is denied at the handshake, exactly
     /// like a bad local token (no auth oracle distinguishing the two).
     #[tokio::test]
