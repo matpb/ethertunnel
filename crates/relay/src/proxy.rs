@@ -439,32 +439,36 @@ pub async fn proxy_http(
         };
 
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        // The visitor never asked to upgrade; forwarding a bare 101 would
+        // desync their connection. Refuse instead.
+        let Some(visitor_upgrade) = visitor_upgrade else {
+            tracing::debug!(%host, "daemon sent 101 without a visitor upgrade request");
+            return relay_502();
+        };
         let daemon_upgrade = hyper::upgrade::on(&mut resp);
-        if let Some(visitor_upgrade) = visitor_upgrade {
-            // This is the long-lived task: re-home the accept-time ConnPermit onto
-            // it (taken exactly once from the shared cell) so the global + per-/64
-            // accept slot is held for the splice's whole life, not released at the
-            // 101. The daemon pump spawned above dies transitively when this
-            // splice's yamux stream closes.
-            let permit = permit_cell.lock().unwrap().take();
-            let idle = dur_or_off(limits.proxy_idle_timeout_secs);
-            let absolute = dur_or_off(limits.proxy_absolute_max_secs);
-            tokio::spawn(async move {
-                let _permit = permit; // held for the splice lifetime, released on drop
-                match (visitor_upgrade.await, daemon_upgrade.await) {
-                    (Ok(v), Ok(d)) => {
-                        let _ = copy_bidirectional_timeout(
-                            &mut TokioIo::new(v),
-                            &mut TokioIo::new(d),
-                            idle,
-                            absolute,
-                        )
-                        .await;
-                    }
-                    _ => tracing::debug!("websocket upgrade handoff failed"),
+        // This is the long-lived task: re-home the accept-time ConnPermit onto
+        // it (taken exactly once from the shared cell) so the global + per-/64
+        // accept slot is held for the splice's whole life, not released at the
+        // 101. The daemon pump spawned above dies transitively when this
+        // splice's yamux stream closes.
+        let permit = permit_cell.lock().unwrap().take();
+        let idle = dur_or_off(limits.proxy_idle_timeout_secs);
+        let absolute = dur_or_off(limits.proxy_absolute_max_secs);
+        tokio::spawn(async move {
+            let _permit = permit; // held for the splice lifetime, released on drop
+            match (visitor_upgrade.await, daemon_upgrade.await) {
+                (Ok(v), Ok(d)) => {
+                    let _ = copy_bidirectional_timeout(
+                        &mut TokioIo::new(v),
+                        &mut TokioIo::new(d),
+                        idle,
+                        absolute,
+                    )
+                    .await;
                 }
-            });
-        }
+                _ => tracing::debug!("websocket upgrade handoff failed"),
+            }
+        });
     }
 
     scrub_response(&mut resp);
@@ -543,6 +547,13 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap, keep_upgrade: bool) {
             continue;
         }
         headers.remove(token.as_str());
+    }
+    // A TE header re-encoded after we strip transfer-encoding leaves a stale
+    // Content-Length that truncates the body; drop it too.
+    if headers.contains_key(hyper::header::TRANSFER_ENCODING)
+        || listed.iter().any(|t| t == "transfer-encoding")
+    {
+        headers.remove(hyper::header::CONTENT_LENGTH);
     }
     for h in HOP_BY_HOP {
         headers.remove(*h);
@@ -693,6 +704,27 @@ mod tests {
             matches!(&inner, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
             "stalled body read should time out, got {inner:?}"
         );
+    }
+
+    /// A Transfer-Encoding header forces Content-Length off too (stale CL would
+    /// truncate the body once TE is stripped and hyper re-encodes with CL).
+    #[test]
+    fn strip_hop_by_hop_removes_content_length_when_te_present() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        headers.insert(hyper::header::CONTENT_LENGTH, "5".parse().unwrap());
+        strip_hop_by_hop(&mut headers, false);
+        assert!(!headers.contains_key(hyper::header::CONTENT_LENGTH));
+        assert!(!headers.contains_key(hyper::header::TRANSFER_ENCODING));
+    }
+
+    /// No Transfer-Encoding: Content-Length is left alone.
+    #[test]
+    fn strip_hop_by_hop_keeps_content_length_without_te() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::CONTENT_LENGTH, "5".parse().unwrap());
+        strip_hop_by_hop(&mut headers, false);
+        assert!(headers.contains_key(hyper::header::CONTENT_LENGTH));
     }
 
     /// The carried accept-permit cell yields its permit at most once: the upgrade

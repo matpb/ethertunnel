@@ -401,6 +401,8 @@ async fn run_serve(config_path: PathBuf, check: bool) -> anyhow::Result<()> {
             cap_prune_grace_secs: po.cap_prune_grace_secs,
             activate_on_claim: po.activate_on_claim,
             benefits: po.benefits.clone(),
+            max_validate_per_sec: po.max_validate_per_sec,
+            validate_burst: po.validate_burst,
         };
         let client = PolarHttpClient::new(po.api_base.clone(), po.organization_id.clone());
         let gate = Arc::new(PolarGate::new(cache, policy, Box::new(client)));

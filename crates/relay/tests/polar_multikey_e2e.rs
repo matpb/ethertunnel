@@ -621,6 +621,8 @@ async fn pooled_cap_survives_small_key_revalidation_then_prunes_on_real_downgrad
                 (TEAM_BENEFIT.to_owned(), TEAM_CAP),
                 (CM_BENEFIT.to_owned(), CM_CAP),
             ]),
+            max_validate_per_sec: 10,
+            validate_burst: 30,
         },
         Box::new(LoopbackPolarBackend::new(mock.base_url.clone())),
     ));

@@ -22,3 +22,4 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+proptest = "1"

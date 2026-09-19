@@ -150,6 +150,18 @@ fn negotiate(peer_min: u16, peer_max: u16) -> Option<u16> {
     (v >= peer_min && v >= 1).then_some(v)
 }
 
+/// Cap on how long a control-frame send may wait on the writer's 64-slot
+/// channel before the sender gives up on this session.
+const CTRL_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Enqueue `frame`, bounded by [`CTRL_SEND_TIMEOUT`]; `false` means terminate.
+async fn push(ctrl_tx: &mpsc::Sender<ControlFrame>, frame: ControlFrame) -> bool {
+    matches!(
+        tokio::time::timeout(CTRL_SEND_TIMEOUT, ctrl_tx.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
 /// Resolve a presented credential to a user: the local token store first (a
 /// cheap in-process hash lookup, and the only path on a self-host relay),
 /// then — when `[polar]` is configured — Polar license-key validation. Used
@@ -195,6 +207,13 @@ pub async fn run_session<T>(
 
     tracing::debug!(session_id, "session started");
     loop {
+        // A pending open whose caller already gave up (router's 5s timeout) must
+        // be dropped, not driven to completion against a dead receiver.
+        if let Some(SessionCmd::OpenStream { reply, .. }) = &pending_open {
+            if reply.is_closed() {
+                pending_open = None;
+            }
+        }
         // The inbound/outbound/command sources all need `&mut conn`, so they
         // share one manual `poll_fn`; cancellation is a separate `select!`
         // branch so its waker is registered properly (a bare `is_cancelled()`
@@ -372,13 +391,19 @@ async fn control_task(
     spawn_writer(wr, ctrl_rx, cancel.clone());
 
     let handle = SessionHandle::new(session_id, user.user_id, ctrl_tx.clone(), cmd_tx.clone());
-    let _ = ctrl_tx
-        .send(ControlFrame::Welcome {
+    if !push(
+        &ctrl_tx,
+        ControlFrame::Welcome {
             proto,
             server_version: ctx.server_version.clone(),
             session_id,
-        })
-        .await;
+        },
+    )
+    .await
+    {
+        tracing::debug!(session_id, "control write stalled; closing session");
+        return Ok(());
+    }
     tracing::info!(session_id, user = %user.name, proto, "session authenticated");
 
     // --- Steady-state loop with heartbeat dead-man + token re-validation ---
@@ -416,18 +441,37 @@ async fn control_task(
                         Some(u) if u.user_id == user.user_id => {}
                         _ => {
                             tracing::info!(session_id, "credential revoked; closing session");
-                            let _ = ctrl_tx
-                                .send(ControlFrame::Denied {
+                            push(
+                                &ctrl_tx,
+                                ControlFrame::Denied {
                                     code: DenyCode::AuthFailed,
                                     message: "token revoked".into(),
-                                })
-                                .await;
+                                },
+                            )
+                            .await;
                             // Best-effort: give the writer task a beat to flush the
                             // Denied to the wire while the actor is still driving
                             // the yamux connection (it only transmits while polled).
                             // Returning immediately would cancel before the flush.
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             return Ok(());
+                        }
+                    }
+                    // Admin revocation runs in another process against the DB and
+                    // never touches this session's live routes; re-check ownership.
+                    let routed = ctx.router.hostnames_of(session_id);
+                    let revoked: Vec<String> = routed
+                        .into_iter()
+                        .filter(|h| !ctx.auth.owns_hostname(user.user_id, h))
+                        .collect();
+                    if !revoked.is_empty() {
+                        let evicted = ctx.router.evict_routes(&revoked, &[]);
+                        tracing::info!(session_id, hosts = evicted.len(), "hostname ownership revoked; evicting");
+                        for (handle, resource) in evicted {
+                            handle.send_ctrl(ControlFrame::Denied {
+                                code: DenyCode::NotOwner,
+                                message: format!("tunnel {resource:?} stopped: hostname revoked"),
+                            });
                         }
                     }
                     // The credential still resolves to this user, but the license
@@ -446,12 +490,14 @@ async fn control_task(
                                 user = %user.name,
                                 "license lapsed; closing session"
                             );
-                            let _ = ctrl_tx
-                                .send(ControlFrame::Denied {
+                            push(
+                                &ctrl_tx,
+                                ControlFrame::Denied {
                                     code: DenyCode::LimitExceeded,
                                     message: "subscription lapsed or suspended".into(),
-                                })
-                                .await;
+                                },
+                            )
+                            .await;
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             return Ok(());
                         }
@@ -470,10 +516,8 @@ async fn control_task(
             Ok(Ok(f)) => f,
         };
 
-        match frame {
-            ControlFrame::Ping { nonce } => {
-                let _ = ctrl_tx.send(ControlFrame::Pong { nonce }).await;
-            }
+        let ok = match frame {
+            ControlFrame::Ping { nonce } => push(&ctrl_tx, ControlFrame::Pong { nonce }).await,
             ControlFrame::Claim {
                 hostnames,
                 tcp_ports,
@@ -487,14 +531,12 @@ async fn control_task(
                     tcp_ports,
                     &ctrl_tx,
                 )
-                .await;
+                .await
             }
             ControlFrame::Release {
                 hostnames,
                 tcp_ports,
-            } => {
-                handle_release(ctx, &user, token.expose(), hostnames, tcp_ports, &ctrl_tx).await;
-            }
+            } => handle_release(ctx, &user, token.expose(), hostnames, tcp_ports, &ctrl_tx).await,
             ControlFrame::ListOwned => {
                 // Report the cap the relay already enforces (advisory only). No
                 // Polar gate (self-host / no licensing) => no cap. An
@@ -510,32 +552,39 @@ async fn control_task(
                         CapDecision::DenyAll => Some(0),
                     }
                 });
-                let _ = ctrl_tx
-                    .send(ControlFrame::Owned {
+                push(
+                    &ctrl_tx,
+                    ControlFrame::Owned {
                         hostnames: ctx.auth.owned_hostnames(user.user_id),
                         tcp_ports: ctx.auth.owned_ports(user.user_id),
                         max_tunnels,
-                    })
-                    .await;
+                    },
+                )
+                .await
             }
             ControlFrame::Goodbye => return Ok(()),
             ControlFrame::Hello { .. } => {
-                let _ = ctrl_tx
-                    .send(ControlFrame::Error {
+                push(
+                    &ctrl_tx,
+                    ControlFrame::Error {
                         code: ethertunnel_proto::frames::ErrorCode::MalformedClaim,
                         message: "duplicate Hello".into(),
-                    })
-                    .await;
+                    },
+                )
+                .await
             }
             // Relay→daemon frames must never arrive from the daemon; ignore.
-            _ => {}
+            _ => true,
+        };
+        if !ok {
+            tracing::debug!(session_id, "control write stalled; closing session");
+            return Ok(());
         }
     }
 }
 
-/// Validate and apply a claim (atomic, idempotent), then reply. `token` is
-/// the session's presented credential, needed so a Polar-licensed claim can
-/// hold its device activation (`limit_activations`).
+/// Validate and apply a claim (atomic, idempotent), then reply.
+/// Returns `false` (caller must terminate) when the reply write stalled.
 async fn handle_claim(
     ctx: &Arc<SessionCtx>,
     handle: &SessionHandle,
@@ -544,21 +593,22 @@ async fn handle_claim(
     hostnames: Vec<String>,
     tcp_ports: Vec<u16>,
     ctrl_tx: &mpsc::Sender<ControlFrame>,
-) {
+) -> bool {
     // Bound per-claim work: a 64 KiB control frame can pack thousands of tiny
     // entries, each of which we lowercase and ownership-check. Reject oversized
     // claims outright; a daemon needing more sends additional claims.
     if hostnames.len() + tcp_ports.len() > ethertunnel_proto::limits::MAX_CLAIM_ENTRIES {
-        let _ = ctrl_tx
-            .send(ControlFrame::Denied {
+        return push(
+            ctrl_tx,
+            ControlFrame::Denied {
                 code: DenyCode::ProtocolError,
                 message: format!(
                     "claim too large (max {} entries)",
                     ethertunnel_proto::limits::MAX_CLAIM_ENTRIES
                 ),
-            })
-            .await;
-        return;
+            },
+        )
+        .await;
     }
 
     let hostnames: Vec<String> = hostnames.iter().map(|h| h.to_ascii_lowercase()).collect();
@@ -566,36 +616,39 @@ async fn handle_claim(
     let tcp = ctx.tcp.load_full();
     for port in &tcp_ports {
         let Some(manager) = &tcp else {
-            let _ = ctrl_tx
-                .send(ControlFrame::Denied {
+            return push(
+                ctrl_tx,
+                ControlFrame::Denied {
                     code: DenyCode::PortNotReserved,
                     message: "tcp tunnels are not enabled on this relay".into(),
-                })
-                .await;
-            return;
+                },
+            )
+            .await;
         };
         // TCP ports are admin-granted only (there is no self-service port-claim
         // path), so they are not subject to the self-service `max_tunnels` claim
         // cap that hostnames go through — a user cannot self-inflate the port
         // count past an admin grant. This asymmetry with hostnames is intentional.
         if !manager.in_range(*port) || !ctx.auth.owns_port(user.user_id, *port) {
-            let _ = ctrl_tx
-                .send(ControlFrame::Denied {
+            return push(
+                ctrl_tx,
+                ControlFrame::Denied {
                     code: DenyCode::PortNotReserved,
                     message: format!("port {port} not reserved"),
-                })
-                .await;
-            return;
+                },
+            )
+            .await;
         }
         // Bind-before-grant: never route a port we couldn't actually serve.
         if let Err(e) = manager.ensure_bound(*port).await {
-            let _ = ctrl_tx
-                .send(ControlFrame::Denied {
+            return push(
+                ctrl_tx,
+                ControlFrame::Denied {
                     code: DenyCode::PortUnavailable,
                     message: format!("port {port} unavailable: {e}"),
-                })
-                .await;
-            return;
+                },
+            )
+            .await;
         }
     }
 
@@ -613,29 +666,29 @@ async fn handle_claim(
     let mut cap: Option<i64> = None;
     if let Some(gate) = ctx.polar.load_full() {
         use crate::polar::{now_unix, CapDecision};
-        // Device binding: the first claim on a Polar key activates it (and a
-        // reconnect re-uses the stored activation). A key already activated
-        // elsewhere is refused before any label is registered. Local tokens
-        // pass straight through (no license row -> no-op Ok).
+        // Registers one Polar activation per key (shows as in-use in the
+        // portal); it does not limit how many daemons share the key.
         if let Err(why) = gate.ensure_activated(token).await {
-            let _ = ctrl_tx
-                .send(ControlFrame::Denied {
+            return push(
+                ctrl_tx,
+                ControlFrame::Denied {
                     code: DenyCode::LimitExceeded,
                     message: why,
-                })
-                .await;
-            return;
+                },
+            )
+            .await;
         }
         match gate.cap_for(&user.name, now_unix()) {
             CapDecision::Allow => {}
             CapDecision::DenyAll => {
-                let _ = ctrl_tx
-                    .send(ControlFrame::Denied {
+                return push(
+                    ctrl_tx,
+                    ControlFrame::Denied {
                         code: DenyCode::LimitExceeded,
                         message: "subscription does not permit new tunnels".into(),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
             }
             CapDecision::Cap(max) => {
                 cap = Some(max);
@@ -643,15 +696,16 @@ async fn handle_claim(
                     ctx.router
                         .projected_tunnel_count(user.user_id, &hostnames, &tcp_ports);
                 if projected as i64 > max {
-                    let _ = ctrl_tx
-                        .send(ControlFrame::Denied {
+                    return push(
+                        ctrl_tx,
+                        ControlFrame::Denied {
                             code: DenyCode::LimitExceeded,
                             message: format!(
                                 "tunnel limit reached ({max}); upgrade your plan for more"
                             ),
-                        })
-                        .await;
-                    return;
+                        },
+                    )
+                    .await;
                 }
             }
         }
@@ -675,47 +729,49 @@ async fn handle_claim(
         match ctx.auth.claim_hostname(user.user_id, host, cap) {
             ClaimOutcome::Owned => {}
             ClaimOutcome::Taken => {
-                let _ = ctrl_tx
-                    .send(ControlFrame::Denied {
+                return push(
+                    ctrl_tx,
+                    ControlFrame::Denied {
                         code: DenyCode::NotOwner,
                         message: format!("not authorized for {host}"),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
             }
             ClaimOutcome::CapExceeded => {
-                // Authoritative owned-row cap hit: this free label would push the
-                // account past its plan limit. Deny in the existing LimitExceeded
-                // style; no label was registered (the cap check is inside the
-                // insert path).
+                // Authoritative owned-row cap hit: no label was registered (the
+                // cap check is inside the insert path).
                 let max = cap.unwrap_or_default();
-                let _ = ctrl_tx
-                    .send(ControlFrame::Denied {
+                return push(
+                    ctrl_tx,
+                    ControlFrame::Denied {
                         code: DenyCode::LimitExceeded,
                         message: format!(
                             "tunnel limit reached ({max}); upgrade your plan for more"
                         ),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
             }
             ClaimOutcome::Invalid(why) => {
-                let _ = ctrl_tx
-                    .send(ControlFrame::Denied {
+                return push(
+                    ctrl_tx,
+                    ControlFrame::Denied {
                         code: DenyCode::NotOwner,
                         message: format!("cannot claim {host}: {why}"),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
             }
             ClaimOutcome::Error => {
-                let _ = ctrl_tx
-                    .send(ControlFrame::Denied {
+                return push(
+                    ctrl_tx,
+                    ControlFrame::Denied {
                         code: DenyCode::NotOwner,
                         message: format!("could not register {host}"),
-                    })
-                    .await;
-                return;
+                    },
+                )
+                .await;
             }
         }
     }
@@ -724,12 +780,14 @@ async fn handle_claim(
     for (old, resource) in superseded {
         old.send_ctrl(ControlFrame::Superseded { resource });
     }
-    let _ = ctrl_tx
-        .send(ControlFrame::Granted {
+    push(
+        ctrl_tx,
+        ControlFrame::Granted {
             hostnames,
             tcp_ports,
-        })
-        .await;
+        },
+    )
+    .await
 }
 
 /// Release resources the caller owns: drop the owned registry rows (freeing the
@@ -744,20 +802,21 @@ async fn handle_release(
     hostnames: Vec<String>,
     tcp_ports: Vec<u16>,
     ctrl_tx: &mpsc::Sender<ControlFrame>,
-) {
+) -> bool {
     // Same per-request bound as claims: a 64 KiB frame can pack thousands of
     // entries, each costing an ownership-checked delete.
     if hostnames.len() + tcp_ports.len() > ethertunnel_proto::limits::MAX_CLAIM_ENTRIES {
-        let _ = ctrl_tx
-            .send(ControlFrame::Denied {
+        return push(
+            ctrl_tx,
+            ControlFrame::Denied {
                 code: DenyCode::ProtocolError,
                 message: format!(
                     "release too large (max {} entries)",
                     ethertunnel_proto::limits::MAX_CLAIM_ENTRIES
                 ),
-            })
-            .await;
-        return;
+            },
+        )
+        .await;
     }
 
     let hostnames: Vec<String> = hostnames.iter().map(|h| h.to_ascii_lowercase()).collect();
@@ -801,12 +860,14 @@ async fn handle_release(
         }
     }
 
-    let _ = ctrl_tx
-        .send(ControlFrame::Released {
+    push(
+        ctrl_tx,
+        ControlFrame::Released {
             hostnames: released_hosts,
             tcp_ports: released_ports,
-        })
-        .await;
+        },
+    )
+    .await
 }
 
 /// Write a terminal `Denied` frame, then keep the connection alive briefly so
@@ -851,11 +912,10 @@ fn spawn_writer(
 ) {
     tokio::spawn(async move {
         while let Some(frame) = ctrl_rx.recv().await {
-            if codec::write_frame(&mut wr, &frame, MAX_CONTROL_FRAME)
-                .await
-                .is_err()
-            {
-                break;
+            let write = codec::write_frame(&mut wr, &frame, MAX_CONTROL_FRAME);
+            match tokio::time::timeout(Duration::from_secs(30), write).await {
+                Ok(Ok(())) => {}
+                _ => break, // write failed or stalled past the timeout
             }
         }
         cancel.cancel();
@@ -1666,5 +1726,111 @@ mod tests {
         assert!(res.is_err(), "expected dead-man close, got {res:?}");
         // And the route is released.
         assert!(router.lookup_http("myapp.ethertunnel.com").is_none());
+    }
+
+    /// Pings keep the dead-man reset, but if the peer never reads the Pongs
+    /// back, push() must eventually time out and close the session.
+    #[tokio::test(start_paused = true)]
+    async fn peer_that_never_reads_is_closed_within_ctrl_send_timeout() {
+        let (ctx, router, _auth, _uid) = fixture();
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["myapp.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
+
+        // From here on, never read again: flood Pings so the relay's Pong
+        // replies fill the 64-slot ctrl channel once the writer stalls.
+        tokio::spawn(async move {
+            let mut nonce = 0u64;
+            loop {
+                if send_ping(&mut ctrl, nonce).await.is_err() {
+                    break;
+                }
+                nonce += 1;
+            }
+        });
+
+        let closed = tokio::time::timeout(CTRL_SEND_TIMEOUT * 3, async {
+            loop {
+                if router.lookup_http("myapp.ethertunnel.com").is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "a peer that never reads must be closed within ~CTRL_SEND_TIMEOUT"
+        );
+    }
+
+    async fn send_ping(ctrl: &mut Ctrl, nonce: u64) -> Result<(), CodecError> {
+        codec::write_frame(ctrl, &ControlFrame::Ping { nonce }, MAX_CONTROL_FRAME).await
+    }
+
+    /// Admin hostname removal (out-of-band DB write, router untouched) must be
+    /// picked up by the session's own revalidation tick and evict the route.
+    #[tokio::test(start_paused = true)]
+    async fn revoked_hostname_ownership_evicts_route_on_revalidation() {
+        let (ctx, router, auth, uid) = fixture();
+        const REVALIDATE_SECS: u64 = 10;
+        ctx.set_token_revalidate_interval_secs(REVALIDATE_SECS);
+
+        let mut ctrl = connect(ctx).await;
+        handshake(&mut ctrl, "etun_good").await;
+        send(
+            &mut ctrl,
+            ControlFrame::Claim {
+                hostnames: vec!["myapp.ethertunnel.com".into()],
+                tcp_ports: vec![],
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv(&mut ctrl).await,
+            ControlFrame::Granted { .. }
+        ));
+        assert!(router.lookup_http("myapp.ethertunnel.com").is_some());
+
+        // Simulate `etun admin hostname rm`: drop ownership directly, leaving
+        // the live route untouched (a separate process would do the same).
+        assert!(auth.release_hostname(uid, "myapp.ethertunnel.com"));
+
+        let evicted = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if router.lookup_http("myapp.ethertunnel.com").is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        assert!(
+            evicted.is_ok(),
+            "revoked hostname ownership must be evicted within ~2x the revalidate interval"
+        );
+        match recv(&mut ctrl).await {
+            ControlFrame::Denied { code, message } => {
+                assert_eq!(code, DenyCode::NotOwner);
+                let expected = Resource::Host("myapp.ethertunnel.com".into());
+                assert!(
+                    message.contains(&format!("{expected:?}")),
+                    "Denied message must name the evicted resource, got: {message}"
+                );
+            }
+            other => panic!("expected Denied(NotOwner), got {other:?}"),
+        }
     }
 }

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use base64::Engine;
 use rand::RngCore;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -38,6 +38,8 @@ pub enum RegistryError {
     PortTaken(u16),
     #[error("tunnel cap reached: already owns the maximum number of resources")]
     CapExceeded,
+    #[error("invalid user name: {0}")]
+    InvalidUser(&'static str),
 }
 
 /// Reserved labels that may never be claimed as tunnel hostnames.
@@ -215,6 +217,12 @@ impl Registry {
     // --- admin operations ---
 
     pub fn add_user(&self, name: &str) -> Result<i64, RegistryError> {
+        if name.is_empty() {
+            return Err(RegistryError::InvalidUser("must not be empty"));
+        }
+        if name.len() > 200 {
+            return Err(RegistryError::InvalidUser("must be at most 200 bytes"));
+        }
         let conn = self.conn.lock().unwrap();
         let exists: bool = conn
             .query_row("SELECT 1 FROM users WHERE name = ?1", [name], |_| Ok(()))
@@ -351,29 +359,31 @@ impl Registry {
         name: &str,
         release_ports: bool,
     ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
-        let conn = self.conn.lock().unwrap();
-        let id = Self::user_id(&conn, name)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = Self::user_id(&tx, name)?;
         let hostnames: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT label FROM hostnames WHERE user_id = ?1")?;
+            let mut stmt = tx.prepare("SELECT label FROM hostnames WHERE user_id = ?1")?;
             let rows = stmt
                 .query_map([id], |r| r.get(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
-        conn.execute("DELETE FROM hostnames WHERE user_id = ?1", [id])?;
+        tx.execute("DELETE FROM hostnames WHERE user_id = ?1", [id])?;
         let ports = if release_ports {
             let ports: Vec<u16> = {
-                let mut stmt = conn.prepare("SELECT port FROM tcp_ports WHERE user_id = ?1")?;
+                let mut stmt = tx.prepare("SELECT port FROM tcp_ports WHERE user_id = ?1")?;
                 let rows = stmt
                     .query_map([id], |r| Ok(r.get::<_, i64>(0)? as u16))?
                     .collect::<Result<Vec<_>, _>>()?;
                 rows
             };
-            conn.execute("DELETE FROM tcp_ports WHERE user_id = ?1", [id])?;
+            tx.execute("DELETE FROM tcp_ports WHERE user_id = ?1", [id])?;
             ports
         } else {
             Vec::new()
         };
+        tx.commit()?;
         Ok((hostnames, ports))
     }
 
@@ -482,10 +492,11 @@ impl Registry {
         max: Option<i64>,
     ) -> Result<bool, RegistryError> {
         validate_label(label).map_err(|e| RegistryError::InvalidLabel(label.to_owned(), e))?;
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Fast path: already owned by this user → idempotent no-op. Re-claiming a
         // label you already hold never counts against the cap.
-        let owner: Option<i64> = conn
+        let owner: Option<i64> = tx
             .query_row(
                 "SELECT user_id FROM hostnames WHERE label = ?1",
                 [label],
@@ -500,9 +511,9 @@ impl Registry {
             };
         }
         // Free label: enforce the cap against the owned-row count BEFORE the
-        // insert, under this same lock so the check-then-act is atomic.
+        // insert, inside the same transaction so the check-then-act is atomic.
         if let Some(m) = max {
-            let owned: i64 = conn.query_row(
+            let owned: i64 = tx.query_row(
                 "SELECT (SELECT COUNT(*) FROM hostnames WHERE user_id=?1)
                       + (SELECT COUNT(*) FROM tcp_ports WHERE user_id=?1)",
                 [user_id],
@@ -515,11 +526,14 @@ impl Registry {
         // Attempt the insert. A concurrent writer may have claimed it between the
         // SELECT and here; the UNIQUE index makes the INSERT the real arbiter and
         // surfaces the race as LabelTaken.
-        match conn.execute(
+        match tx.execute(
             "INSERT INTO hostnames (user_id, label, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![user_id, label, Self::now()],
         ) {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                tx.commit()?;
+                Ok(true)
+            }
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
@@ -534,7 +548,7 @@ impl Registry {
     /// `cap` resources (by `created_at`, ties broken by the stable rowid/port key)
     /// and drop the newest over the cap. Hostnames and ports are pooled into one
     /// owned set and ordered together, so the newest acquisitions go first
-    /// regardless of kind (matching the [`CapDecision`](crate::entitlement::CapDecision)
+    /// regardless of kind (matching the [`CapDecision`](crate::polar::CapDecision)
     /// "grandfather oldest-N, prune newest over cap" semantics).
     ///
     /// Runs under the connection mutex so the count-then-delete is atomic against
@@ -546,14 +560,33 @@ impl Registry {
         user_id: i64,
         cap: i64,
     ) -> Result<(Vec<String>, Vec<u16>), RegistryError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let (removed_hosts, removed_ports) = Self::over_cap(&conn, user_id, cap)?;
+        if removed_hosts.is_empty() && removed_ports.is_empty() {
+            return Ok((removed_hosts, removed_ports));
+        }
+        // Irreversible: the only delete of a tenant's resources without their request.
+        tracing::warn!(
+            user_id,
+            cap,
+            labels = ?removed_hosts,
+            ports = ?removed_ports,
+            "pruning owned resources over cap"
+        );
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for label in &removed_hosts {
-            conn.execute("DELETE FROM hostnames WHERE label = ?1", [label])?;
+            tx.execute(
+                "DELETE FROM hostnames WHERE label = ?1 AND user_id = ?2",
+                rusqlite::params![label, user_id],
+            )?;
         }
         for &port in &removed_ports {
-            conn.execute("DELETE FROM tcp_ports WHERE port = ?1", [port as i64])?;
+            tx.execute(
+                "DELETE FROM tcp_ports WHERE port = ?1 AND user_id = ?2",
+                rusqlite::params![port as i64, user_id],
+            )?;
         }
+        tx.commit()?;
         Ok((removed_hosts, removed_ports))
     }
 
@@ -713,9 +746,10 @@ impl Registry {
     }
 
     pub fn add_port(&self, port: u16, user: &str) -> Result<(), RegistryError> {
-        let conn = self.conn.lock().unwrap();
-        let id = Self::user_id(&conn, user)?;
-        let taken: Option<i64> = conn
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = Self::user_id(&tx, user)?;
+        let taken: Option<i64> = tx
             .query_row(
                 "SELECT user_id FROM tcp_ports WHERE port = ?1",
                 [port],
@@ -725,10 +759,11 @@ impl Registry {
         if taken.is_some() {
             return Err(RegistryError::PortTaken(port));
         }
-        conn.execute(
+        tx.execute(
             "INSERT INTO tcp_ports (port, user_id, created_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![port, id, Self::now()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1400,5 +1435,60 @@ mod tests {
             CAP,
             "owned-row count must equal CAP exactly, never exceed it"
         );
+    }
+
+    /// prune_owned_to_cap must never delete another user's row sharing a label
+    /// with an over-cap row it just computed (the missing user_id predicate bug).
+    #[test]
+    fn prune_never_deletes_another_users_row_with_same_label() {
+        let r = reg();
+        let mat = r.add_user("mat").unwrap();
+        let eve = r.add_user("eve").unwrap();
+        {
+            let conn = r.conn.lock().unwrap();
+            for (uid, label, ts) in [(mat, "shared", 100i64), (mat, "extra", 200)] {
+                conn.execute(
+                    "INSERT INTO hostnames (user_id, label, created_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![uid, label, ts],
+                )
+                .unwrap();
+            }
+        }
+        // Eve owns a *different* label so the UNIQUE(label) index doesn't block
+        // this setup; the guard under test is the user_id predicate, not uniqueness.
+        r.add_hostname("shared-eve", "eve").unwrap();
+
+        let (removed, _) = r.prune_owned_to_cap(mat, 1).unwrap();
+        assert_eq!(removed, vec!["extra".to_string()]);
+        assert!(r.owns_hostname(mat, "shared.ethertunnel.com"));
+        assert!(r.owns_hostname(eve, "shared-eve.ethertunnel.com"));
+    }
+
+    /// claim_label_capped still enforces the cap at the commit boundary of its
+    /// Immediate transaction: a claim past the cap is refused, nothing leaked.
+    #[test]
+    fn claim_label_capped_enforces_cap_under_immediate_transaction() {
+        let r = reg();
+        let mat = r.add_user("acct_mat").unwrap();
+        assert!(r.claim_label_capped(mat, "one", Some(1)).unwrap());
+        assert!(matches!(
+            r.claim_label_capped(mat, "two", Some(1)),
+            Err(RegistryError::CapExceeded)
+        ));
+        assert!(!r.owns_hostname(mat, "two.ethertunnel.com"));
+        assert_eq!(r.count_owned_resources(mat).unwrap(), 1);
+    }
+
+    #[test]
+    fn add_user_rejects_empty_and_oversize_names() {
+        let r = reg();
+        assert!(matches!(r.add_user(""), Err(RegistryError::InvalidUser(_))));
+        let too_long = "a".repeat(201);
+        assert!(matches!(
+            r.add_user(&too_long),
+            Err(RegistryError::InvalidUser(_))
+        ));
+        let exactly_200 = "a".repeat(200);
+        assert!(r.add_user(&exactly_200).is_ok());
     }
 }

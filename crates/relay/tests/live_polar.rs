@@ -134,6 +134,8 @@ async fn live_pooled_cap_survives_a_small_sibling_key() {
         benefits: [(ben_big.clone(), BIG), (ben_small.clone(), SMALL)]
             .into_iter()
             .collect(),
+        max_validate_per_sec: 10,
+        validate_burst: 30,
     };
     let registry = Arc::new(Registry::open_in_memory("ethertunnel.com").unwrap());
     let router = Arc::new(Router::new());
