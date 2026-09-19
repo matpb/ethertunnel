@@ -86,7 +86,8 @@ port_range = [20000, 20999]
 # # to it — a prune stricter than the claim gate would delete what it just
 # # authorized.
 # cap_prune_grace_secs = 2592000
-# # Enforce limit_activations (device binding) via Polar activate()/deactivate().
+# # Register one Polar activation per key (shows as in-use in the customer
+# # portal). This does NOT limit how many daemons may share one key.
 # activate_on_claim = true
 #
 # # License-Key BENEFIT id -> max concurrent tunnels. This map is the relay's
@@ -98,3 +99,29 @@ port_range = [20000, 20999]
 # "YOUR-INDIE-LICENSE-BENEFIT-UUID" = 3
 # "YOUR-PRO-LICENSE-BENEFIT-UUID" = 10
 # "YOUR-TEAM-LICENSE-BENEFIT-UUID" = 30
+
+# Anti-DoS admission limits for the public :443 listener. All commented values
+# below are the compiled-in defaults; uncomment to override.
+# [limits]
+# Hard ceiling on concurrent connections process-wide.
+# max_connections = 4096
+# Max concurrent connections per source key (IPv6 keyed by /64).
+# max_connections_per_ip = 64
+# Deadline (seconds) for a visitor to finish sending request headers. 0 disables.
+# header_read_timeout_secs = 10
+# Hard ceiling on concurrent live daemon control sessions process-wide.
+# max_sessions = 4096
+# Max concurrent live control sessions per source key (IPv6 keyed by /64).
+# max_sessions_per_ip = 64
+# Tear down a visitor splice/body after this many idle seconds, either
+# direction. Reset on activity. 0 disables.
+# proxy_idle_timeout_secs = 1800
+# Absolute ceiling (seconds) on a single visitor splice regardless of
+# activity. 0 disables.
+# proxy_absolute_max_secs = 0
+# How often (seconds) a live control session re-validates its bearer token, so
+# an admin revocation takes effect within one interval. 0 disables.
+# token_revalidate_interval_secs = 60
+# Pre-TLS per-IP accept token-bucket: refill rate (tokens/sec) and burst size.
+# accept_rate_per_sec = 20
+# accept_burst = 40

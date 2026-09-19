@@ -127,7 +127,10 @@ pub async fn serve_with(
 
     // Per-IP accept-*rate* limiter (pre-TLS), the concurrent-*connection* cap,
     // and the raw-TCP tunnel port manager.
-    let rate = Arc::new(RateLimiter::new(20, 40));
+    let rate = Arc::new(RateLimiter::new(
+        config.limits.accept_rate_per_sec,
+        config.limits.accept_burst,
+    ));
     let conn_limiter = ConnLimiter::new(
         config.limits.max_connections,
         config.limits.max_connections_per_ip,
@@ -290,6 +293,8 @@ async fn handle_conn(
     };
 
     let mut builder = hyper::server::conn::http1::Builder::new();
+    // Bound header/line buffering so a peer can't force unbounded growth pre-parse.
+    builder.max_buf_size(64 * 1024);
     // Bound slowloris: cap how long a client may take to send its request line +
     // headers after the TLS handshake. The route()/auth logic only runs once the
     // headers arrive, so without this an unauthenticated peer could stall forever.
@@ -439,9 +444,14 @@ fn handle_control_upgrade(
     ])
 }
 
-/// The `Host` header, lowercased and port-stripped.
-fn host_of(req: &Request<hyper::body::Incoming>) -> Option<String> {
-    let raw = req.headers().get(hyper::header::HOST)?.to_str().ok()?;
+/// The `Host` header, lowercased and port-stripped. A duplicate `Host` header
+/// is ambiguous framing; `None` here becomes a 404 in `route()`.
+fn host_of<B>(req: &Request<B>) -> Option<String> {
+    let mut values = req.headers().get_all(hyper::header::HOST).iter();
+    let raw = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
     let host = raw.split(':').next().unwrap_or(raw);
     Some(host.to_ascii_lowercase())
 }
@@ -459,4 +469,36 @@ fn is_websocket_upgrade(req: &Request<hyper::body::Incoming>) -> bool {
             .unwrap_or(false)
     }
     header_contains(req, UPGRADE, "websocket") && header_contains(req, CONNECTION, "upgrade")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::header::HOST;
+
+    fn req_with_hosts(hosts: &[&str]) -> Request<()> {
+        let mut builder = Request::builder().uri("/");
+        for h in hosts {
+            builder = builder.header(HOST, *h);
+        }
+        builder.body(()).unwrap()
+    }
+
+    #[test]
+    fn host_of_single_header_is_lowercased_and_port_stripped() {
+        let req = req_with_hosts(&["Example.COM:8443"]);
+        assert_eq!(host_of(&req), Some("example.com".to_owned()));
+    }
+
+    #[test]
+    fn host_of_duplicate_header_is_rejected() {
+        let req = req_with_hosts(&["a.example.com", "b.example.com"]);
+        assert_eq!(host_of(&req), None);
+    }
+
+    #[test]
+    fn host_of_missing_header_is_none() {
+        let req = req_with_hosts(&[]);
+        assert_eq!(host_of(&req), None);
+    }
 }

@@ -54,23 +54,24 @@ pub struct LimitsConfig {
     /// Defaults to `max_connections_per_ip`.
     #[serde(default = "default_max_sessions_per_ip")]
     pub max_sessions_per_ip: u32,
-    /// Tear down a visitor splice / proxied body after this many seconds with
-    /// zero bytes in *either* direction. Reset-on-activity, so busy long-lived
-    /// WebSockets are unaffected. 0 disables — and 0 is the default: idle
-    /// connections are NEVER reaped out of the box (a quiet-but-alive raw-TCP /
-    /// SSH / DB tunnel must survive). The now-enforced concurrency caps bound the
-    /// DoS; set this (e.g. 60) only on relays that serve solely keepalive traffic.
+    /// Tear down a visitor splice/body after this many idle seconds (either
+    /// direction). Reset-on-activity. 0 disables. Default 1800s.
     #[serde(default = "default_proxy_idle_timeout_secs")]
     pub proxy_idle_timeout_secs: u64,
-    /// Absolute ceiling (seconds) on a single visitor splice regardless of
-    /// activity. 0 disables — the default, so legitimate long-lived tunnels are
-    /// never severed out of the box (3600 is the documented hardened value).
+    /// Absolute ceiling (seconds) on a splice regardless of activity. 0
+    /// disables. Default 0 (off).
     #[serde(default = "default_proxy_absolute_max_secs")]
     pub proxy_absolute_max_secs: u64,
     /// How often (seconds) an established control session re-validates its bearer
     /// token, so an admin revocation takes effect within one interval. 0 disables.
     #[serde(default = "default_token_revalidate_interval_secs")]
     pub token_revalidate_interval_secs: u64,
+    /// Pre-TLS per-IP accept token-bucket refill rate (tokens/sec).
+    #[serde(default = "default_accept_rate_per_sec")]
+    pub accept_rate_per_sec: u32,
+    /// Pre-TLS per-IP accept token-bucket burst capacity.
+    #[serde(default = "default_accept_burst")]
+    pub accept_burst: u32,
 }
 
 impl Default for LimitsConfig {
@@ -84,6 +85,8 @@ impl Default for LimitsConfig {
             proxy_idle_timeout_secs: default_proxy_idle_timeout_secs(),
             proxy_absolute_max_secs: default_proxy_absolute_max_secs(),
             token_revalidate_interval_secs: default_token_revalidate_interval_secs(),
+            accept_rate_per_sec: default_accept_rate_per_sec(),
+            accept_burst: default_accept_burst(),
         }
     }
 }
@@ -109,7 +112,7 @@ fn default_max_sessions_per_ip() -> u32 {
 }
 
 fn default_proxy_idle_timeout_secs() -> u64 {
-    0
+    1800
 }
 
 fn default_proxy_absolute_max_secs() -> u64 {
@@ -118,6 +121,14 @@ fn default_proxy_absolute_max_secs() -> u64 {
 
 fn default_token_revalidate_interval_secs() -> u64 {
     60
+}
+
+fn default_accept_rate_per_sec() -> u32 {
+    20
+}
+
+fn default_accept_burst() -> u32 {
+    40
 }
 
 /// Polar.sh licensing integration. When present, the relay authenticates
@@ -154,8 +165,8 @@ pub struct PolarConfig {
     /// destroy what the claim gate still authorizes.
     #[serde(default = "default_polar_cap_prune_grace_secs")]
     pub cap_prune_grace_secs: i64,
-    /// Enforce `limit_activations` (device binding) by calling Polar
-    /// activate()/deactivate() around claim/release.
+    /// Register one Polar activation per key (via activate()/deactivate())
+    /// so it shows as in-use in the customer portal. Does not limit sharing.
     #[serde(default = "default_polar_activate_on_claim")]
     pub activate_on_claim: bool,
     /// `benefit_id -> max_tunnels`. The relay's ONLY source of per-plan
@@ -164,6 +175,21 @@ pub struct PolarConfig {
     /// A granted key whose benefit is missing from this map is denied.
     #[serde(default)]
     pub benefits: std::collections::HashMap<String, i64>,
+    /// Relay-wide budget on Polar validate() HTTP calls (token bucket refill
+    /// rate, per second). Caps unauthenticated quota burn from junk keys.
+    #[serde(default = "default_polar_max_validate_per_sec")]
+    pub max_validate_per_sec: u32,
+    /// Token-bucket burst capacity for `max_validate_per_sec`.
+    #[serde(default = "default_polar_validate_burst")]
+    pub validate_burst: u32,
+}
+
+fn default_polar_max_validate_per_sec() -> u32 {
+    10
+}
+
+fn default_polar_validate_burst() -> u32 {
+    30
 }
 
 fn default_polar_api_base() -> String {
@@ -397,9 +423,27 @@ mod tests {
         // New fields default to the ratified values.
         assert_eq!(l.max_sessions, 4096);
         assert_eq!(l.max_sessions_per_ip, 64);
-        assert_eq!(l.proxy_idle_timeout_secs, 0); // idle reaping OFF by default — never kill idle connections
-        assert_eq!(l.proxy_absolute_max_secs, 0); // disabled by default
+        assert_eq!(l.proxy_idle_timeout_secs, 1800);
+        assert_eq!(l.proxy_absolute_max_secs, 0);
         assert_eq!(l.token_revalidate_interval_secs, 60);
+        assert_eq!(l.accept_rate_per_sec, 20);
+        assert_eq!(l.accept_burst, 40);
+    }
+
+    /// accept_rate_per_sec / accept_burst parse from an explicit [limits] block.
+    #[test]
+    fn limits_accept_rate_and_burst_parse() {
+        let toml = r#"
+            [server]
+            domain = "example.com"
+
+            [limits]
+            accept_rate_per_sec = 5
+            accept_burst = 15
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("[limits] with accept_* loads");
+        assert_eq!(cfg.limits.accept_rate_per_sec, 5);
+        assert_eq!(cfg.limits.accept_burst, 15);
     }
 
     /// A `[limits]` block that sets only the *old* fields still loads; the new
@@ -421,9 +465,11 @@ mod tests {
         // Untouched new knobs keep their defaults.
         assert_eq!(l.max_sessions, 4096);
         assert_eq!(l.max_sessions_per_ip, 64);
-        assert_eq!(l.proxy_idle_timeout_secs, 0); // idle reaping OFF by default
+        assert_eq!(l.proxy_idle_timeout_secs, 1800);
         assert_eq!(l.proxy_absolute_max_secs, 0);
         assert_eq!(l.token_revalidate_interval_secs, 60);
+        assert_eq!(l.accept_rate_per_sec, 20);
+        assert_eq!(l.accept_burst, 40);
     }
 
     /// The `[polar]` block parses with per-field defaults; only

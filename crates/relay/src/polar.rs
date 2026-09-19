@@ -25,10 +25,8 @@
 //!  * If Polar is unreachable, a previously-granted key is honored for up to
 //!    `staleness_secs` past its last successful validation (fail-open,
 //!    bounded), mirroring the old entitlement-cache staleness ceiling.
-//!  * `limit_activations` (device binding) is enforced by calling
-//!    `activate` on the first claim and remembering our `activation_id`, so
-//!    a reconnecting daemon re-uses its activation instead of tripping the
-//!    limit it created.
+//!  * `limit_activations` registers one Polar activation per key so it shows
+//!    as in-use in the portal. It does not limit how many daemons share it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -74,6 +72,12 @@ fn hash_key(key: &str) -> Vec<u8> {
     Sha256::digest(key.as_bytes()).to_vec()
 }
 
+/// A validate-response id field must be non-empty and bounded; Polar ids are
+/// short UUIDs, so anything else is a malformed or hostile response.
+fn is_sane_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 200
+}
+
 /// Policy derived from the `[polar]` config block.
 #[derive(Clone)]
 pub struct PolarPolicy {
@@ -97,6 +101,10 @@ pub struct PolarPolicy {
     pub activate_on_claim: bool,
     /// `benefit_id -> max_tunnels`: the relay's only source of capacity.
     pub benefits: HashMap<String, i64>,
+    /// Token-bucket refill rate for `backend.validate()` calls, relay-wide.
+    pub max_validate_per_sec: u32,
+    /// Token-bucket burst capacity for `max_validate_per_sec`.
+    pub validate_burst: u32,
 }
 
 /// What a validate round-trip concluded about a key.
@@ -154,12 +162,14 @@ pub struct PolarHttpClient {
 impl PolarHttpClient {
     pub fn new(api_base: String, organization_id: String) -> Self {
         crate::tls::ensure_crypto_provider();
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(std::time::Duration::from_secs(5)));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_only()
             .enable_http1()
             .enable_http2()
-            .build();
+            .wrap_connector(connector);
         let client = Client::builder(TokioExecutor::new()).build(https);
         Self {
             client,
@@ -181,13 +191,18 @@ impl PolarHttpClient {
             .header("User-Agent", "ethertunnel-relay/1")
             .body(Full::new(Bytes::from(body.to_string())))
             .map_err(|e| e.to_string())?;
-        let resp = self.client.request(req).await.map_err(|e| e.to_string())?;
+        let resp =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.client.request(req))
+                .await
+                .map_err(|_| "polar request timed out".to_owned())?
+                .map_err(|e| e.to_string())?;
         let status = resp.status();
-        let bytes = resp
-            .into_body()
+        // 64 KiB is far past any real validate/activate body; a bigger one
+        // is a misbehaving or hostile peer.
+        let bytes = http_body_util::Limited::new(resp.into_body(), 64 * 1024)
             .collect()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|_| "polar response body too large".to_owned())?
             .to_bytes();
         Ok((status, bytes))
     }
@@ -207,6 +222,8 @@ struct ActivateResp {
     id: String,
 }
 
+// No unit test for the status-code mapping below: MockBackend (test_support)
+// implements PolarBackend at the ValidateOutcome level, never a raw HTTP status.
 impl PolarBackend for PolarHttpClient {
     fn validate<'a>(&'a self, key: &'a str) -> BoxFuture<'a, ValidateOutcome> {
         Box::pin(async move {
@@ -220,21 +237,36 @@ impl PolarBackend for PolarHttpClient {
             {
                 Ok((status, bytes)) if status.is_success() => {
                     match serde_json::from_slice::<ValidateResp>(&bytes) {
-                        Ok(v) if v.status == "granted" => ValidateOutcome::Granted {
-                            customer_id: v.customer_id,
-                            benefit_id: v.benefit_id,
-                        },
+                        Ok(v) if v.status == "granted" => {
+                            if !is_sane_id(&v.customer_id) || !is_sane_id(&v.benefit_id) {
+                                ValidateOutcome::Unavailable(
+                                    "malformed validate response".to_owned(),
+                                )
+                            } else {
+                                ValidateOutcome::Granted {
+                                    customer_id: v.customer_id,
+                                    benefit_id: v.benefit_id,
+                                }
+                            }
+                        }
                         // revoked / disabled — definitive.
                         Ok(_) => ValidateOutcome::NotLicensed,
                         Err(e) => ValidateOutcome::Unavailable(format!("bad validate body: {e}")),
                     }
                 }
-                // 429 and 5xx are transient; every other status (404 invalid-
-                // or-revoked, 403, 422 malformed key) is a definitive no.
+                // 429 and 5xx are transient; 404/403/422 are Polar's documented
+                // invalid/revoked/malformed-key answers, a definitive no.
                 Ok((status, _)) if status.as_u16() == 429 || status.is_server_error() => {
                     ValidateOutcome::Unavailable(format!("polar validate: {status}"))
                 }
-                Ok(_) => ValidateOutcome::NotLicensed,
+                Ok((status, _)) if matches!(status.as_u16(), 404 | 403 | 422) => {
+                    ValidateOutcome::NotLicensed
+                }
+                // Anything else (400, 401, 405, 408, 410, 3xx, unexpected) is
+                // NOT a documented invalid/revoked answer: never negative-cache it.
+                Ok((status, _)) => {
+                    ValidateOutcome::Unavailable(format!("polar validate: unexpected {status}"))
+                }
                 Err(e) => ValidateOutcome::Unavailable(e),
             }
         })
@@ -386,11 +418,13 @@ impl LicenseCache {
     ///
     /// `min_validated_at` is the ONLY bound on an abandoned key's influence:
     /// the cache holds key hashes, never plaintext, so the relay can never
-    /// re-validate a key nobody presents.
+    /// re-validate a key nobody presents. `now` also excludes a clock-skewed
+    /// future-dated row from the MAX, matching the fresh-cache check.
     pub fn cap_for_customer(
         &self,
         customer_id: &str,
         min_validated_at: i64,
+        now: i64,
     ) -> Result<CustomerCap, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -398,9 +432,10 @@ impl LicenseCache {
                     MAX(CASE WHEN status = 'granted'
                               AND max_tunnels IS NOT NULL
                               AND validated_at >= ?2
+                              AND validated_at <= ?3
                              THEN max_tunnels END)
              FROM license_validation WHERE customer_id = ?1",
-            rusqlite::params![customer_id, min_validated_at],
+            rusqlite::params![customer_id, min_validated_at, now],
             |r| {
                 Ok(CustomerCap {
                     rows: r.get(0)?,
@@ -434,6 +469,17 @@ impl LicenseCache {
                 row.activation_id,
                 row.validated_at,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete negative-cache rows (customer_id = "") older than
+    /// `older_than`, bounding unbounded growth from key-spam.
+    pub fn sweep_negative(&self, older_than: i64) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM license_validation WHERE customer_id = '' AND validated_at < ?1",
+            [older_than],
         )?;
         Ok(())
     }
@@ -474,12 +520,47 @@ pub struct Reconciler {
     pub domain: String,
 }
 
+/// Relay-wide token bucket gating outbound `validate()` calls.
+struct ValidateBudget {
+    rate: f64,
+    burst: f64,
+    state: Mutex<(f64, std::time::Instant)>,
+}
+
+impl ValidateBudget {
+    fn new(rate: u32, burst: u32) -> Self {
+        let burst = (burst.max(1)) as f64;
+        Self {
+            rate: rate as f64,
+            burst,
+            state: Mutex::new((burst, std::time::Instant::now())),
+        }
+    }
+
+    /// Take one token if available, refilling for elapsed time first.
+    fn try_take(&self) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        let (tokens, last) = &mut *guard;
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(*last).as_secs_f64();
+        *last = now;
+        *tokens = (*tokens + elapsed * self.rate).min(self.burst);
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The Polar license gate: validation cache + policy + backend.
 pub struct PolarGate {
     cache: LicenseCache,
     policy: PolarPolicy,
     backend: Box<dyn PolarBackend>,
     reconciler: arc_swap::ArcSwapOption<Reconciler>,
+    validate_budget: ValidateBudget,
 }
 
 impl PolarGate {
@@ -500,11 +581,14 @@ impl PolarGate {
             );
             policy.cap_prune_grace_secs = policy.staleness_secs;
         }
+        let validate_budget =
+            ValidateBudget::new(policy.max_validate_per_sec, policy.validate_burst);
         Self {
             cache,
             policy,
             backend,
             reconciler: arc_swap::ArcSwapOption::empty(),
+            validate_budget,
         }
     }
 
@@ -525,18 +609,28 @@ impl PolarGate {
     /// key is honored for `staleness_secs` past its last validation when
     /// Polar is unreachable.
     pub async fn authenticate(&self, key: &str) -> Option<AuthedUser> {
+        // Local `etun admin` tokens are never Polar credentials: skip the
+        // gate entirely, no HTTP, no cache row.
+        if key.starts_with("etun_") {
+            return None;
+        }
         let rec = self.reconciler.load_full()?;
         let key_hash = hash_key(key);
         let now = now_unix();
+        if now == 0 {
+            tracing::error!("system clock unavailable; denying Polar auth");
+            return None;
+        }
 
         let cached = self.cache.get(&key_hash).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "license cache read failed");
             None
         });
 
-        // Fresh cache hit: no network round-trip, positive or negative.
+        // Fresh cache hit: no network round-trip, positive or negative. A
+        // row timestamped in the future cannot be trusted as fresh.
         if let Some(row) = &cached {
-            if now <= row.validated_at + self.policy.cache_ttl_secs {
+            if now >= row.validated_at && now <= row.validated_at + self.policy.cache_ttl_secs {
                 if row.status == "granted" && row.max_tunnels.is_some() {
                     return self.resolve_user(&rec, &row.customer_id);
                 }
@@ -544,7 +638,12 @@ impl PolarGate {
             }
         }
 
-        match self.backend.validate(key).await {
+        let outcome = if self.validate_budget.try_take() {
+            self.backend.validate(key).await
+        } else {
+            ValidateOutcome::Unavailable("relay validate budget exhausted".into())
+        };
+        match outcome {
             ValidateOutcome::Granted {
                 customer_id,
                 benefit_id,
@@ -567,7 +666,8 @@ impl PolarGate {
                     validated_at: now,
                 };
                 if let Err(e) = self.cache.upsert(&row) {
-                    tracing::warn!(error = %e, "license cache upsert failed");
+                    tracing::error!(error = %e, "license cache upsert failed; denying");
+                    return None;
                 }
                 let cap = cap?; // this key's benefit is unmapped -> deny this key
                 let user = self.resolve_user(&rec, &customer_id)?;
@@ -575,12 +675,28 @@ impl PolarGate {
                 Some(user)
             }
             ValidateOutcome::NotLicensed => {
-                if let Some(mut row) = cached {
-                    row.status = "not_licensed".into();
-                    row.validated_at = now;
-                    if let Err(e) = self.cache.upsert(&row) {
-                        tracing::warn!(error = %e, "license cache upsert failed");
+                // Negative-cache an unknown key too, so a repeat presentation
+                // is denied from cache instead of costing another HTTPS call.
+                let is_new_negative = cached.is_none();
+                let mut row = cached.unwrap_or_else(|| LicenseRow {
+                    key_hash: key_hash.clone(),
+                    customer_id: String::new(),
+                    benefit_id: String::new(),
+                    max_tunnels: None,
+                    status: "not_licensed".into(),
+                    activation_id: None,
+                    validated_at: now,
+                });
+                row.status = "not_licensed".into();
+                row.validated_at = now;
+                // Bound unbounded growth from key-spam before adding another row.
+                if is_new_negative {
+                    if let Err(e) = self.cache.sweep_negative(now - self.policy.cache_ttl_secs) {
+                        tracing::warn!(error = %e, "negative-cache sweep failed");
                     }
+                }
+                if let Err(e) = self.cache.upsert(&row) {
+                    tracing::warn!(error = %e, "license cache upsert failed");
                 }
                 None
             }
@@ -589,6 +705,7 @@ impl PolarGate {
                 if let Some(row) = cached {
                     if row.status == "granted"
                         && row.max_tunnels.is_some()
+                        && now >= row.validated_at
                         && now <= row.validated_at + self.policy.staleness_secs
                     {
                         tracing::warn!(
@@ -612,12 +729,21 @@ impl PolarGate {
     /// keys gets the MAX of their caps: the keys share one registry account,
     /// so the cheapest one must not define the pool. The `ListOwned` advisory
     /// therefore reports the shared pool's cap, which may exceed the plan the
-    /// presenting key belongs to — that is the number the relay enforces.
+    /// presenting key belongs to — that is the number the relay enforces. A
+    /// cache read failure or an unavailable clock fails closed to `DenyAll`.
     pub fn cap_for(&self, user_name: &str, now: i64) -> CapDecision {
+        if now == 0 {
+            tracing::error!("system clock unavailable; denying cap");
+            return CapDecision::DenyAll;
+        }
         // A grant nobody could re-validate for the whole staleness window is
         // no longer trustworthy. Live sessions re-validate every tick, so this
         // only bites when Polar has been unreachable for days.
-        self.resolve_cap(user_name, now.saturating_sub(self.policy.staleness_secs))
+        self.resolve_cap(
+            user_name,
+            now.saturating_sub(self.policy.staleness_secs),
+            now,
+        )
     }
 
     /// Pooled cap for a customer, counting only keys validated at or after
@@ -630,12 +756,15 @@ impl PolarGate {
     /// *relative* to the customer's newest key would drop a legitimately
     /// offline daemon (laptop shut overnight) out of the MAX and re-create the
     /// very bug this resolution exists to fix.
-    fn resolve_cap(&self, customer_id: &str, min_validated_at: i64) -> CapDecision {
-        let resolved = match self.cache.cap_for_customer(customer_id, min_validated_at) {
+    fn resolve_cap(&self, customer_id: &str, min_validated_at: i64, now: i64) -> CapDecision {
+        let resolved = match self
+            .cache
+            .cap_for_customer(customer_id, min_validated_at, now)
+        {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(customer_id, error = %e, "license cache read failed; allowing");
-                return CapDecision::Allow;
+                tracing::error!(customer_id, error = %e, "license cache read failed; denying");
+                return CapDecision::DenyAll;
             }
         };
         if resolved.rows == 0 {
@@ -649,10 +778,8 @@ impl PolarGate {
         }
     }
 
-    /// Ensure the key holds its device activation before a claim proceeds.
-    /// No-op (Ok) when activation is disabled, the credential is not a
-    /// Polar-cached key (local token), or we already hold an activation id.
-    /// `Err(msg)` means the claim must be denied.
+    /// Ensure the key holds its portal activation before a claim proceeds.
+    /// `Err(msg)` means the claim must be denied (activation limit hit).
     pub async fn ensure_activated(&self, key: &str) -> Result<(), String> {
         if !self.policy.activate_on_claim {
             return Ok(());
@@ -725,7 +852,8 @@ impl PolarGate {
     /// a failed upsert would otherwise leave its row out of the aggregate and
     /// tear down tunnels it pays for.
     fn enforce_pooled_cap(&self, rec: &Reconciler, user: &AuthedUser, cap: i64, now: i64) {
-        let pooled_over = |window: i64| self.resolve_cap(&user.name, now.saturating_sub(window));
+        let pooled_over =
+            |window: i64| self.resolve_cap(&user.name, now.saturating_sub(window), now);
         // A non-`Cap` decision here means the cache could not answer — the
         // upsert above failed, or the read did. A broken cache must never tear
         // anything down, least of all to zero.
@@ -818,6 +946,11 @@ impl PolarGate {
     /// account name IS the Polar `customer_id` (opaque, stable, unique), so
     /// provisioning is implicit and idempotent.
     fn resolve_user(&self, rec: &Reconciler, customer_id: &str) -> Option<AuthedUser> {
+        // Real customer ids come from Polar and are never empty; an empty id
+        // is a negative-cache placeholder row and must never resolve a user.
+        if customer_id.is_empty() {
+            return None;
+        }
         match rec.registry.lookup_user_id(customer_id) {
             Ok(Some(user_id)) => {
                 return Some(AuthedUser {
@@ -991,6 +1124,8 @@ pub(crate) mod test_support {
             cap_prune_grace_secs: 2_592_000,
             activate_on_claim: true,
             benefits: benefits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            max_validate_per_sec: 10,
+            validate_burst: 30,
         }
     }
 
@@ -1098,6 +1233,138 @@ mod tests {
         );
         assert!(gate.authenticate("CMND-WRONG").await.is_none());
         // No phantom account.
+        assert_eq!(registry.lookup_user_id("cust_1").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn unknown_key_is_negatively_cached() {
+        let backend = Arc::new(MockBackend::granting(KEY, "cust_1", "ben_cm"));
+        let (gate, _registry, _router) = gate_with(backend.clone(), &[("ben_cm", 1)]);
+        assert!(gate.authenticate("CMND-JUNK").await.is_none());
+        assert!(gate.authenticate("CMND-JUNK").await.is_none());
+        assert_eq!(
+            backend.validate_calls.load(Ordering::Relaxed),
+            1,
+            "second presentation must be served from the negative cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_negative_rows_are_swept_on_new_unknown_key() {
+        let backend = Arc::new(MockBackend::granting(KEY, "cust_1", "ben_cm"));
+        let (gate, _registry, _router) = gate_with(backend, &[("ben_cm", 1)]);
+
+        assert!(gate.authenticate("CMND-FIRST-JUNK").await.is_none());
+        let hash1 = hash_key("CMND-FIRST-JUNK");
+        assert!(gate.cache.get(&hash1).unwrap().is_some());
+
+        // Age the first row past cache_ttl_secs via a second handle on the
+        // same in-memory-backed cache is not possible; age it in place.
+        let mut row1 = gate.cache.get(&hash1).unwrap().unwrap();
+        row1.validated_at = now_unix() - gate.policy.cache_ttl_secs - 1;
+        gate.cache.upsert(&row1).unwrap();
+
+        assert!(gate.authenticate("CMND-SECOND-JUNK").await.is_none());
+        assert!(
+            gate.cache.get(&hash1).unwrap().is_none(),
+            "expired negative row must be swept away by the next unknown key"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_budget_exhaustion_still_honors_cached_grant() {
+        let backend = Arc::new(MockBackend::granting(KEY, "cust_1", "ben_cm"));
+        let mut policy = test_policy(&[("ben_cm", 1)]);
+        policy.max_validate_per_sec = 0;
+        policy.validate_burst = 1;
+        let (gate, _registry, _router) = gate_with_policy(backend, policy);
+
+        gate.authenticate(KEY)
+            .await
+            .expect("first call spends the token");
+        let mut row = gate.cache.get(&hash_key(KEY)).unwrap().unwrap();
+        row.validated_at = now_unix() - gate.policy.cache_ttl_secs - 1;
+        gate.cache.upsert(&row).unwrap();
+
+        let user = gate
+            .authenticate(KEY)
+            .await
+            .expect("budget-exhausted call still honors the cached grant");
+        assert_eq!(user.name, "cust_1");
+    }
+
+    #[tokio::test]
+    async fn cache_read_error_denies_all() {
+        use std::sync::atomic::AtomicU64;
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "etun-test-polar-fail-{}-{n}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let cache = LicenseCache::open(&path).unwrap();
+        cache
+            .upsert(&LicenseRow {
+                key_hash: hash_key("K"),
+                customer_id: "cust_1".into(),
+                benefit_id: "ben_cm".into(),
+                max_tunnels: Some(5),
+                status: "granted".into(),
+                activation_id: None,
+                validated_at: now_unix(),
+            })
+            .unwrap();
+        let (gate, _registry, _router) = gate_with_policy(
+            Arc::new(MockBackend::default()),
+            test_policy(&[("ben_cm", 5)]),
+        );
+        drop(gate); // release the in-memory cache before swapping cache below
+        let gate2 = PolarGate::new(
+            cache,
+            test_policy(&[]),
+            Box::new(Arc::new(MockBackend::default())),
+        );
+        assert_eq!(gate2.cap_for("cust_1", now_unix()), CapDecision::Cap(5));
+
+        // A second connection drops the table out from under it.
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("DROP TABLE license_validation").unwrap();
+        assert_eq!(gate2.cap_for("cust_1", now_unix()), CapDecision::DenyAll);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn future_dated_row_is_treated_stale() {
+        let (gate, _registry, _router) = gate_with(
+            Arc::new(MockBackend::granting(KEY, "cust_1", "ben_cm")),
+            &[("ben_cm", 1)],
+        );
+        let now = now_unix();
+        seed_license_at(&gate, KEY, "cust_1", "granted", Some(1), now + 10_000);
+        // A future-dated row must not pass the fresh-cache check, forcing a
+        // real re-validate instead of a blind trust.
+        let user = gate
+            .authenticate(KEY)
+            .await
+            .expect("re-validated instead of trusting the future row");
+        assert_eq!(user.name, "cust_1");
+    }
+
+    #[tokio::test]
+    async fn zero_clock_is_treated_as_unavailable() {
+        let (gate, _registry, _router) = gate_with(Arc::new(MockBackend::default()), &[]);
+        seed_license(&gate, "K", "cust_1", "granted", Some(5));
+        assert_eq!(gate.cap_for("cust_1", 0), CapDecision::DenyAll);
+    }
+
+    #[tokio::test]
+    async fn etun_prefixed_credential_never_reaches_backend() {
+        let backend = Arc::new(MockBackend::granting("etun_abc", "cust_1", "ben_cm"));
+        let (gate, registry, _router) = gate_with(backend.clone(), &[("ben_cm", 1)]);
+        assert!(gate.authenticate("etun_abc").await.is_none());
+        assert_eq!(backend.validate_calls.load(Ordering::Relaxed), 0);
         assert_eq!(registry.lookup_user_id("cust_1").unwrap(), None);
     }
 
@@ -1546,6 +1813,22 @@ mod tests {
             "granted",
             Some(30),
             now - gate.policy.staleness_secs - 1,
+        );
+        assert_eq!(gate.cap_for("cust_1", now), CapDecision::DenyAll);
+        assert_eq!(gate.cap_for("mat", now), CapDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_customer_whose_only_key_is_future_dated_is_denied_not_uncapped() {
+        let (gate, _registry, _router) = gate_with(Arc::new(MockBackend::default()), &[]);
+        let now = now_unix();
+        seed_license_at(
+            &gate,
+            "K-SKEWED",
+            "cust_1",
+            "granted",
+            Some(30),
+            now + 10_000,
         );
         assert_eq!(gate.cap_for("cust_1", now), CapDecision::DenyAll);
         assert_eq!(gate.cap_for("mat", now), CapDecision::Allow);

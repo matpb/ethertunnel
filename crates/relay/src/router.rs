@@ -213,6 +213,18 @@ impl Router {
         self.inner.read().unwrap().http.len()
     }
 
+    /// Hostnames currently routed to `session_id` (for the per-session
+    /// ownership revalidation tick).
+    pub fn hostnames_of(&self, session_id: u64) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .by_session
+            .get(&session_id)
+            .map(|set| set.hosts.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Count the distinct active tunnels (hostnames + TCP ports) `user_id` would
     /// hold *after* additionally claiming `new_hosts`/`new_ports`. Re-claims of
     /// resources the user already holds do not double-count (set union).
@@ -332,6 +344,24 @@ mod tests {
         // later teardown of the session does not double-remove them (no panic).
         r.remove_session(1);
         assert!(r.lookup_http("keep.example.com").is_none());
+    }
+
+    #[test]
+    fn hostnames_of_lists_a_sessions_routed_hosts() {
+        let r = Router::new();
+        let (h1, _rx1) = handle(1, 100);
+        let (h2, _rx2) = handle(2, 200);
+        r.claim(&h1, &["a.example.com".into(), "b.example.com".into()], &[]);
+        r.claim(&h2, &["c.example.com".into()], &[]);
+
+        let mut hosts = r.hostnames_of(1);
+        hosts.sort();
+        assert_eq!(hosts, vec!["a.example.com", "b.example.com"]);
+        assert_eq!(r.hostnames_of(2), vec!["c.example.com".to_string()]);
+        assert!(r.hostnames_of(999).is_empty());
+
+        r.evict_routes(&["a.example.com".into()], &[]);
+        assert_eq!(r.hostnames_of(1), vec!["b.example.com".to_string()]);
     }
 
     #[test]

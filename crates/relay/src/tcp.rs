@@ -9,11 +9,12 @@
 
 use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ethertunnel_proto::frames::StreamHeader;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::ratelimit::{ConnLimiter, RateLimiter};
@@ -66,14 +67,16 @@ impl TcpPortManager {
         port >= self.port_range[0] && port <= self.port_range[1]
     }
 
-    /// Ensure a listener exists for `port`, binding + spawning its accept loop
-    /// on first use. Idempotent; a bind failure (e.g. port in use) is returned.
+    /// Ensure a listener exists for `port`, binding on first use. Idempotent;
+    /// holds the lock across `bind().await` so concurrent callers can't race it.
     pub async fn ensure_bound(self: &Arc<Self>, port: u16) -> std::io::Result<()> {
-        if self.bound.lock().unwrap().contains(&port) {
+        let mut bound = self.bound.lock().await;
+        if bound.contains(&port) {
             return Ok(());
         }
         let listener = TcpListener::bind((self.bind_ip, port)).await?;
-        self.bound.lock().unwrap().insert(port);
+        bound.insert(port);
+        drop(bound);
 
         let manager = self.clone();
         tokio::spawn(async move {
@@ -146,5 +149,43 @@ impl TcpPortManager {
             self.absolute,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ratelimit::{ConnLimiter, RateLimiter};
+    use crate::router::Router;
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    fn manager() -> Arc<TcpPortManager> {
+        TcpPortManager::new(
+            "127.0.0.1".parse().unwrap(),
+            [1024, 65535],
+            Arc::new(Router::new()),
+            Arc::new(RateLimiter::new(1000, 1000)),
+            ConnLimiter::new(1000, 1000),
+            None,
+            None,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Two concurrent ensure_bound calls on the same free port both succeed:
+    /// the check-and-bind is atomic under the tokio mutex, no EADDRINUSE race.
+    #[tokio::test]
+    async fn concurrent_ensure_bound_same_port_both_ok() {
+        let port = free_port();
+        let m1 = manager();
+        let m2 = m1.clone();
+        let (r1, r2) = tokio::join!(m1.ensure_bound(port), m2.ensure_bound(port));
+        assert!(r1.is_ok(), "{r1:?}");
+        assert!(r2.is_ok(), "{r2:?}");
+        assert!(m1.bound.lock().await.contains(&port));
     }
 }
