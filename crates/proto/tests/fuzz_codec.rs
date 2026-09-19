@@ -330,13 +330,19 @@ proptest! {
                 ArbWsFrame::Close => Message::Close(None),
             };
 
-            let mut buf = vec![0u8; expect_len.unwrap_or(4096).max(1)];
-            let send = writer.send(msg);
-            // Non-data frames legitimately yield no bytes; bound the read.
-            let read = tokio::time::timeout(std::time::Duration::from_secs(1), reader.read(&mut buf));
-            let (send_res, read_res) = futures::future::join(send, read).await;
+            let send_res = writer.send(msg).await;
             let _ = send_res;
-            let read_res = match read_res {
+            // Close right after sending so non-data frames (Text/Ping/Close) end the
+            // stream promptly instead of leaving the read waiting on more input.
+            let _ = writer.close(None).await;
+
+            let mut buf = vec![0u8; expect_len.unwrap_or(4096).max(1)];
+            let read_res = match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                reader.read(&mut buf),
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(_) => return Ok(()),
             };
