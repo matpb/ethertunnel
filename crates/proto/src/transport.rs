@@ -195,6 +195,8 @@ where
 /// request itself. `url` supplies the `Host` and path of the handshake (e.g.
 /// `wss://connect.example.com/connect`) — no TLS is performed here, `io` must
 /// already be encrypted if required.
+// tungstenite's own error type, returned once per handshake: boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 pub async fn mux_io_client<T>(
     io: T,
     url: &str,
