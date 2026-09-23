@@ -163,6 +163,8 @@ impl PolarHttpClient {
     pub fn new(api_base: String, organization_id: String) -> Self {
         crate::tls::ensure_crypto_provider();
         let mut connector = HttpConnector::new();
+        // Default enforce_http rejects every https:// URI before TLS: the v1.4.1 Polar outage.
+        connector.enforce_http(false);
         connector.set_connect_timeout(Some(std::time::Duration::from_secs(5)));
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -1912,5 +1914,28 @@ mod tests {
         }
         drop(cache);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn http_client_dials_https_api_base() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let client =
+            PolarHttpClient::new(format!("https://127.0.0.1:{port}"), "org-test".to_owned());
+        let handle = tokio::spawn(async move {
+            let _ = client.validate("CMND-TEST-KEY-0001").await;
+        });
+
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await;
+        assert!(
+            matches!(accepted, Ok(Ok(_))),
+            "connector never dialed the listener: enforce_http rejected the https:// URI before TCP"
+        );
+        drop(accepted);
+        handle.abort();
     }
 }
